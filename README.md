@@ -1,6 +1,6 @@
 # plex-hot-cache
 
-Transparent SSD caching for Plex media served over SMB/NFS. It sits between Plex and your network share using a FUSE overmount — Plex sees no difference, but episode files are silently pre-copied to local SSD before they're needed. It is meant to be run ON the Plex server itself, but theoretically could be added to your NAS since it relies solely on FUSE R/W events. Eventually I plan to have Plex Integrations directly.
+Transparent SSD caching for Plex media. It sits between Plex and your network share / drive arrays / whatever other data backing using a FUSE overmount — Plex sees no difference, but episode files are silently pre-copied to local SSD before they're needed. It is meant to be run ON the Plex server itself, but theoretically could be added to your NAS since it relies solely on FUSE R/W events. Eventually I plan to have Plex Integrations directly.
 
 No Plex plugins, no API wrappers, no config changes on the Plex side. Drop it in, point it at your media directory, and remove it just as easily. As long as it receives a proper signal that it can handle, you can stop it while your server is running. The current streams will crash and need to be restarted, but your server will not.
 
