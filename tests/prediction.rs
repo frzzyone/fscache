@@ -4,7 +4,7 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use plex_hot_cache::cache::CacheManager;
 use plex_hot_cache::plex_db::PlexDb;
 use plex_hot_cache::predictor::{
-    parse_season_episode, run_copier_task, AccessEvent, CopyRequest, Predictor,
+    parse_season_dir, parse_season_episode, run_copier_task, AccessEvent, CopyRequest, Predictor,
 };
 use plex_hot_cache::scheduler::Scheduler;
 
@@ -202,7 +202,6 @@ async fn predictor_caches_next_episodes_via_regex() {
     access_tx
         .send(AccessEvent {
             relative_path: PathBuf::from("tv/Show/Show.S01E01.mkv"),
-            timestamp: SystemTime::now(),
         })
         .unwrap();
 
@@ -261,7 +260,6 @@ async fn predictor_skips_already_cached() {
     access_tx
         .send(AccessEvent {
             relative_path: PathBuf::from("tv/Show/Show.S01E01.mkv"),
-            timestamp: SystemTime::now(),
         })
         .unwrap();
 
@@ -277,6 +275,121 @@ async fn predictor_skips_already_cached() {
         cache_ep_dir.join("Show.S01E03.mkv").exists(),
         "E03 should be cached"
     );
+
+    unsafe { libc::close(backing_fd) };
+}
+
+// ---- parse_season_dir tests ----
+
+#[test]
+fn season_dir_parses_standard_formats() {
+    assert_eq!(parse_season_dir("Season 1"), Some(1));
+    assert_eq!(parse_season_dir("Season 01"), Some(1));
+    assert_eq!(parse_season_dir("season 3"), Some(3));
+    assert_eq!(parse_season_dir("SEASON 12"), Some(12));
+}
+
+#[test]
+fn season_dir_returns_none_for_non_season() {
+    assert_eq!(parse_season_dir("Breaking Bad"), None);
+    assert_eq!(parse_season_dir("S01E01.mkv"), None);
+    assert_eq!(parse_season_dir("Specials"), None);
+    assert_eq!(parse_season_dir(""), None);
+}
+
+// ---- Cross-season regex fallback tests ----
+
+/// Structured layout: season finale in Season 1/ triggers caching from Season 2/.
+#[tokio::test]
+async fn regex_crosses_season_boundary_structured_layout() {
+    let backing = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    // Show/Season 1/S01E03.mkv (finale), Show/Season 2/S02E01..03.mkv
+    let s1 = backing.path().join("Show/Season 1");
+    let s2 = backing.path().join("Show/Season 2");
+    std::fs::create_dir_all(&s1).unwrap();
+    std::fs::create_dir_all(&s2).unwrap();
+    for i in 1..=3u32 {
+        std::fs::write(s1.join(format!("Show.S01E0{}.mkv", i)), format!("s1e{}", i)).unwrap();
+    }
+    for i in 1..=3u32 {
+        std::fs::write(s2.join(format!("Show.S02E0{}.mkv", i)), format!("s2e{}", i)).unwrap();
+    }
+
+    let backing_fd = open_backing_fd(backing.path());
+    assert!(backing_fd >= 0);
+
+    let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), 1.0, 72, 0.0));
+    let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
+    let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(32);
+    let scheduler = Scheduler::new("00:00", "23:59").unwrap();
+    let predictor = Predictor::new(access_rx, copy_tx, Arc::clone(&cache), 4, None, scheduler, backing_fd);
+    tokio::spawn(predictor.run());
+    tokio::spawn(run_copier_task(backing_fd, copy_rx, Arc::clone(&cache)));
+
+    // Access the season finale — no S01E04+ exists, should spill into Season 2
+    access_tx.send(AccessEvent {
+        relative_path: PathBuf::from("Show/Season 1/Show.S01E03.mkv"),
+    }).unwrap();
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Season 2 episodes should be cached
+    for i in 1..=3u32 {
+        let cached = cache_dir.path().join(format!("Show/Season 2/Show.S02E0{}.mkv", i));
+        assert!(cached.exists(), "expected S02E0{} in cache", i);
+        assert_eq!(std::fs::read_to_string(&cached).unwrap(), format!("s2e{}", i));
+    }
+    // The accessed file itself should NOT be cached
+    assert!(!cache_dir.path().join("Show/Season 1/Show.S01E03.mkv").exists());
+
+    unsafe { libc::close(backing_fd) };
+}
+
+/// Flat layout: all episodes in one folder, season finale triggers next-season episodes
+/// from the same directory.
+#[tokio::test]
+async fn regex_crosses_season_boundary_flat_layout() {
+    let backing = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    // Show/S01E01..03.mkv  S02E01..03.mkv — all in one flat directory
+    let show_dir = backing.path().join("Show");
+    std::fs::create_dir_all(&show_dir).unwrap();
+    for i in 1..=3u32 {
+        std::fs::write(show_dir.join(format!("Show.S01E0{}.mkv", i)), format!("s1e{}", i)).unwrap();
+    }
+    for i in 1..=3u32 {
+        std::fs::write(show_dir.join(format!("Show.S02E0{}.mkv", i)), format!("s2e{}", i)).unwrap();
+    }
+
+    let backing_fd = open_backing_fd(backing.path());
+    assert!(backing_fd >= 0);
+
+    let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), 1.0, 72, 0.0));
+    let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
+    let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(32);
+    let scheduler = Scheduler::new("00:00", "23:59").unwrap();
+    let predictor = Predictor::new(access_rx, copy_tx, Arc::clone(&cache), 4, None, scheduler, backing_fd);
+    tokio::spawn(predictor.run());
+    tokio::spawn(run_copier_task(backing_fd, copy_rx, Arc::clone(&cache)));
+
+    // Access the season finale — no S01E04+ exists in the flat dir, should pick up S02 files
+    access_tx.send(AccessEvent {
+        relative_path: PathBuf::from("Show/Show.S01E03.mkv"),
+    }).unwrap();
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Season 2 episodes should be cached from the same directory
+    for i in 1..=3u32 {
+        let cached = cache_dir.path().join(format!("Show/Show.S02E0{}.mkv", i));
+        assert!(cached.exists(), "expected S02E0{} in cache (flat layout)", i);
+        assert_eq!(std::fs::read_to_string(&cached).unwrap(), format!("s2e{}", i));
+    }
+    // The accessed file itself should NOT be cached
+    assert!(!cache_dir.path().join("Show/Show.S01E03.mkv").exists());
 
     unsafe { libc::close(backing_fd) };
 }

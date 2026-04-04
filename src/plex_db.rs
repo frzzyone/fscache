@@ -29,13 +29,15 @@ impl PlexDb {
         Ok(Self { conn, target_dir: target_dir.to_path_buf() })
     }
 
-    /// Open an in-memory database. Used in tests.
+    /// Open an in-memory database. Used in integration tests.
+    #[allow(dead_code)]
     pub fn open_in_memory(target_dir: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory()?;
         Ok(Self { conn, target_dir: target_dir.to_path_buf() })
     }
 
-    /// Execute arbitrary SQL. Used in tests to populate schema/data.
+    /// Execute arbitrary SQL. Used in integration tests to populate schema/data.
+    #[allow(dead_code)]
     pub fn exec(&self, sql: &str) -> anyhow::Result<()> {
         self.conn.execute_batch(sql)?;
         Ok(())

@@ -18,6 +18,19 @@ pub fn copy_to_cache(backing_fd: RawFd, rel_path: &Path, cache_dest: &Path) -> s
     let partial = partial_path(cache_dest);
     let src_fd = open_via_backing(backing_fd, rel_path)?;
 
+    // Get source file size for logging.
+    let file_size_bytes = unsafe {
+        let mut stat: libc::stat = std::mem::zeroed();
+        if libc::fstat(src_fd, &mut stat) == 0 { stat.st_size as u64 } else { 0 }
+    };
+    tracing::info!(
+        "copy starting: {} ({:.1} MB)",
+        rel_path.display(),
+        file_size_bytes as f64 / 1_048_576.0
+    );
+
+    let started = std::time::Instant::now();
+
     let mut dst_file = match std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -50,7 +63,13 @@ pub fn copy_to_cache(backing_fd: RawFd, rel_path: &Path, cache_dest: &Path) -> s
         return Err(e);
     }
 
-    tracing::debug!("copy_to_cache: {} -> {}", rel_path.display(), cache_dest.display());
+    let elapsed = started.elapsed();
+    tracing::info!(
+        "copy complete: {} ({:.1} MB in {:.1}s)",
+        rel_path.display(),
+        file_size_bytes as f64 / 1_048_576.0,
+        elapsed.as_secs_f64()
+    );
     Ok(())
 }
 

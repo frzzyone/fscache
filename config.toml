@@ -3,6 +3,7 @@ target_directory = "/mnt/media"         # Directory to overmount (existing SMB m
 cache_directory = "/mnt/ssd-cache"      # SSD cache storage (NOT the FUSE mount)
 
 [plex]
+enabled = false                            # Set to true to use Plex DB for episode prediction (false = regex-only)
 db_path = "/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db"
 
 [cache]
@@ -15,3 +16,9 @@ passthrough_mode = false                 # If true, bypass cache entirely (debug
 [schedule]
 cache_window_start = "08:00"             # Allowed caching window start (HH:MM, 24h)
 cache_window_end = "02:00"               # Allowed caching window end (wraps past midnight)
+
+[logging]
+log_directory = "/var/log/plex-hot-cache"  # Directory for rolling daily log files
+console_level = "info"                     # Log level for terminal output (error/warn/info/debug/trace)
+file_level = "debug"                       # Log level for log files (captures full detail)
+quiet_prefixes = ["Movies"]               # Downgrade access/hit/miss logs to DEBUG for these path prefixes

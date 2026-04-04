@@ -21,12 +21,34 @@ impl CacheManager {
         expiry_hours: u64,
         min_free_space_gb: f64,
     ) -> Self {
-        Self {
+        let configured = (max_size_gb * 1_073_741_824.0) as u64;
+        let max_size_bytes = match total_space_bytes(&cache_dir) {
+            Some(total) if configured == 0 || configured > total => {
+                let fallback = total / 2;
+                tracing::warn!(
+                    "max_size_gb={max_size_gb:.2} is invalid for this drive \
+                     (total capacity {:.2} GB); falling back to 50% ({:.2} GB)",
+                    total as f64 / 1_073_741_824.0,
+                    fallback as f64 / 1_073_741_824.0,
+                );
+                fallback
+            }
+            _ => configured,
+        };
+        let cm = Self {
             cache_dir,
-            max_size_bytes: (max_size_gb * 1_073_741_824.0) as u64,
+            max_size_bytes,
             expiry: Duration::from_secs(expiry_hours * 3600),
             min_free_bytes: (min_free_space_gb * 1_073_741_824.0) as u64,
-        }
+        };
+        tracing::info!(
+            "Cache manager: dir={}, max={:.1} GB, expiry={}h, min_free={:.1} GB",
+            cm.cache_dir.display(),
+            cm.max_size_bytes as f64 / 1_073_741_824.0,
+            expiry_hours,
+            min_free_space_gb,
+        );
+        cm
     }
 
     /// Path where a cached copy of `rel_path` would live.
@@ -42,24 +64,40 @@ impl CacheManager {
 
     /// Delete all `.partial` files left over from interrupted copies.
     pub fn startup_cleanup(&self) {
-        remove_partials(&self.cache_dir);
-        tracing::info!("Cache startup cleanup complete for {}", self.cache_dir.display());
+        let removed = remove_partials(&self.cache_dir);
+        let existing = collect_cache_files(&self.cache_dir);
+        let total_bytes: u64 = existing.iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum();
+        tracing::info!(
+            "Cache startup: {} files cached ({:.1} MB used), {} partial files removed",
+            existing.len(),
+            total_bytes as f64 / 1_048_576.0,
+            removed,
+        );
     }
 
     /// Evict expired files, then enforce max size.
     /// Call before starting a new copy or on the periodic janitor tick.
     pub fn evict_if_needed(&self) {
         let now = SystemTime::now();
+        let mut expiry_count = 0u32;
+        let mut size_count = 0u32;
+        let mut reclaimed_bytes = 0u64;
 
         // Phase 1 of eviction: delete files past expiry_hours.
         let mut all = collect_cache_files(&self.cache_dir);
         all.retain(|entry| {
             if let Some(age) = mtime_age(entry, now) {
                 if age > self.expiry {
+                    let file_size = std::fs::metadata(entry).map(|m| m.len()).unwrap_or(0);
                     if let Err(e) = std::fs::remove_file(entry) {
                         tracing::warn!("evict (expiry): failed to delete {}: {e}", entry.display());
                     } else {
-                        tracing::debug!("evict (expiry): deleted {}", entry.display());
+                        tracing::info!("evict (expired): {}", entry.display());
+                        expiry_count += 1;
+                        reclaimed_bytes += file_size;
                     }
                     return false;
                 }
@@ -75,6 +113,13 @@ impl CacheManager {
             .sum();
 
         if total <= self.max_size_bytes {
+            if expiry_count > 0 {
+                tracing::info!(
+                    "eviction complete: {} expired files removed ({:.1} MB reclaimed)",
+                    expiry_count,
+                    reclaimed_bytes as f64 / 1_048_576.0,
+                );
+            }
             return;
         }
 
@@ -93,9 +138,20 @@ impl CacheManager {
             if let Err(e) = std::fs::remove_file(&path) {
                 tracing::warn!("evict (size): failed to delete {}: {e}", path.display());
             } else {
-                tracing::debug!("evict (size): deleted {}", path.display());
+                tracing::info!("evict (size limit): {}", path.display());
+                size_count += 1;
+                reclaimed_bytes += size;
                 total = total.saturating_sub(size);
             }
+        }
+
+        if expiry_count > 0 || size_count > 0 {
+            tracing::info!(
+                "eviction complete: {} expired + {} size-limit files removed ({:.1} MB reclaimed)",
+                expiry_count,
+                size_count,
+                reclaimed_bytes as f64 / 1_048_576.0,
+            );
         }
     }
 
@@ -106,25 +162,26 @@ impl CacheManager {
             .unwrap_or(false)
     }
 
-    pub fn cache_dir(&self) -> &Path {
-        &self.cache_dir
-    }
 }
 
 // ---- helpers ----
 
-fn remove_partials(dir: &Path) {
+fn remove_partials(dir: &Path) -> u32 {
+    let mut count = 0u32;
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                remove_partials(&path);
+                count += remove_partials(&path);
             } else if path.extension().map_or(false, |e| e == "partial") {
-                let _ = std::fs::remove_file(&path);
-                tracing::debug!("startup_cleanup: removed {}", path.display());
+                if std::fs::remove_file(&path).is_ok() {
+                    tracing::debug!("startup_cleanup: removed {}", path.display());
+                    count += 1;
+                }
             }
         }
     }
+    count
 }
 
 /// Recursively collect all regular (non-.partial) files under `dir`.
@@ -161,6 +218,19 @@ fn free_space_bytes(path: &Path) -> Option<u64> {
     let rc = unsafe { libc::statvfs(c.as_ptr(), &mut stat) };
     if rc == 0 {
         Some(stat.f_bavail * stat.f_bsize as u64)
+    } else {
+        None
+    }
+}
+
+fn total_space_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut stat) };
+    if rc == 0 {
+        Some(stat.f_blocks * stat.f_frsize as u64)
     } else {
         None
     }

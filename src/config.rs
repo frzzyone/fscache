@@ -11,6 +11,8 @@ pub struct Config {
     pub cache: CacheConfig,
     #[serde(default)]
     pub schedule: ScheduleConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -23,6 +25,8 @@ pub struct PathsConfig {
 pub struct PlexConfig {
     #[serde(default = "default_plex_db_path")]
     pub db_path: String,
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +71,35 @@ impl Default for ScheduleConfig {
         }
     }
 }
+
+#[derive(Debug, Deserialize)]
+pub struct LoggingConfig {
+    #[serde(default = "default_log_directory")]
+    pub log_directory: String,
+    #[serde(default = "default_console_level")]
+    pub console_level: String,
+    #[serde(default = "default_file_level")]
+    pub file_level: String,
+    /// Path prefixes whose access/hit/miss logs are downgraded from INFO to DEBUG.
+    /// Matched against the first path component (e.g. "Movies" matches "Movies/foo" but not "Movies2/foo").
+    #[serde(default)]
+    pub quiet_prefixes: Vec<String>,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            log_directory: default_log_directory(),
+            console_level: default_console_level(),
+            file_level: default_file_level(),
+            quiet_prefixes: vec![],
+        }
+    }
+}
+
+fn default_log_directory() -> String { "/var/log/plex-hot-cache".to_string() }
+fn default_console_level() -> String { "info".to_string() }
+fn default_file_level() -> String { "debug".to_string() }
 
 fn default_plex_db_path() -> String {
     "/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db".to_string()

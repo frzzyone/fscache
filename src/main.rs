@@ -12,6 +12,7 @@ use clap::Parser;
 use fuser::{MountOption, SessionACL};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing_subscriber::prelude::*;
 
 const BUILD_VERSION: &str = env!("BUILD_VERSION");
 
@@ -29,9 +30,6 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
-    tracing::info!("plex-hot-cache {} starting", BUILD_VERSION);
-
     let args = Args::parse();
 
     let (config, config_path) = match args.config {
@@ -39,9 +37,41 @@ async fn main() -> anyhow::Result<()> {
         None => config::load()?,
     };
 
+    // Set up layered tracing: console (colored, info-level) + rolling file (debug-level).
+    let console_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&config.logging.console_level));
+
+    let file_filter = tracing_subscriber::EnvFilter::new(&config.logging.file_level);
+
+    std::fs::create_dir_all(&config.logging.log_directory).ok();
+    let file_appender = tracing_appender::rolling::daily(&config.logging.log_directory, "plex-hot-cache.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_filter(console_filter),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_target(true)
+                .with_writer(non_blocking)
+                .with_filter(file_filter),
+        )
+        .init();
+
+    tracing::info!("plex-hot-cache {} starting", BUILD_VERSION);
     tracing::info!("Config: {}", config_path.display());
     tracing::info!("Target: {}", config.paths.target_directory);
     tracing::info!("Cache:  {}", config.paths.cache_directory);
+    tracing::info!(
+        "Log directory: {} (console={}, file={})",
+        config.logging.log_directory,
+        config.logging.console_level,
+        config.logging.file_level
+    );
 
     if config.cache.passthrough_mode {
         tracing::warn!("passthrough_mode = true — cache is bypassed, acting as pure proxy");
@@ -58,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
     // Open O_PATH fd to target BEFORE mounting FUSE over it
     let mut fs = fuse_fs::PlexHotCacheFs::new(&target)?;
     fs.passthrough_mode = config.cache.passthrough_mode;
+    fs.quiet_prefixes = config.logging.quiet_prefixes.clone();
 
     // Set up SSD cache overlay.
     let cache_manager = Arc::new(cache::CacheManager::new(
@@ -74,13 +105,28 @@ async fn main() -> anyhow::Result<()> {
         &config.schedule.cache_window_start,
         &config.schedule.cache_window_end,
     )?;
-    let plex_db = plex_db::PlexDb::open(
-        std::path::Path::new(&config.plex.db_path),
-        &target,
-    ).ok();
-    if plex_db.is_none() {
-        tracing::warn!("Plex DB not available at {}, using regex fallback", config.plex.db_path);
-    }
+    tracing::info!(
+        "Schedule: caching allowed {} to {}",
+        config.schedule.cache_window_start,
+        config.schedule.cache_window_end
+    );
+
+    let plex_db_enabled = config.plex.enabled.unwrap_or(true);
+    let plex_db = if plex_db_enabled {
+        let db = plex_db::PlexDb::open(
+            std::path::Path::new(&config.plex.db_path),
+            &target,
+        ).ok();
+        if db.is_some() {
+            tracing::info!("Plex DB opened: {}", config.plex.db_path);
+        } else {
+            tracing::warn!("Plex DB not available at {}, using regex fallback", config.plex.db_path);
+        }
+        db
+    } else {
+        tracing::info!("Plex DB disabled, using regex-only mode");
+        None
+    };
 
     let (access_tx, access_rx) = tokio::sync::mpsc::unbounded_channel();
     let (copy_tx, copy_rx) = tokio::sync::mpsc::channel::<predictor::CopyRequest>(64);
@@ -129,7 +175,28 @@ async fn main() -> anyhow::Result<()> {
         _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
     }
 
-    // _session drops here → triggers fusermount -u, original directory reappears
-    tracing::info!("Unmounted. Goodbye.");
+    // Lazy unmount: detach the mount point from the namespace immediately so
+    // no new opens arrive, but Plex's already-open file descriptors remain
+    // valid and in-progress streams continue uninterrupted.
+    tracing::info!("Lazy unmount of {} (existing streams unaffected)", target.display());
+    let status = std::process::Command::new("fusermount")
+        .args(["-uz", "--"])
+        .arg(&target)
+        .status();
+    match status {
+        Ok(s) if s.success() => tracing::info!("Lazy unmount succeeded"),
+        Ok(s) => tracing::warn!("fusermount -uz exited with {}", s),
+        Err(e) => {
+            tracing::warn!("fusermount not available ({}), trying umount -l", e);
+            let _ = std::process::Command::new("umount").arg("-l").arg(&target).status();
+        }
+    }
+
+    // Brief grace period for any in-flight FUSE reads to complete.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    // _session drops here. The mount is already detached, so Drop is a no-op or benign.
+    drop(_session);
+    tracing::info!("Shutdown complete.");
     Ok(())
 }

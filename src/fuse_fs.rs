@@ -30,6 +30,8 @@ pub struct PlexHotCacheFs {
     pub cache: Option<Arc<CacheManager>>,
     /// Channel to send access events to the predictor task.
     pub access_tx: Option<tokio::sync::mpsc::UnboundedSender<AccessEvent>>,
+    /// Path prefixes whose access/hit/miss logs are downgraded from INFO to DEBUG.
+    pub quiet_prefixes: Vec<String>,
 }
 
 impl PlexHotCacheFs {
@@ -57,7 +59,12 @@ impl PlexHotCacheFs {
             passthrough_mode: false,
             cache: None,
             access_tx: None,
+            quiet_prefixes: vec![],
         })
+    }
+
+    fn is_quiet(&self, path: &Path) -> bool {
+        self.quiet_prefixes.iter().any(|prefix| path.starts_with(prefix))
     }
 
     // ---- backing store helpers ----
@@ -247,9 +254,13 @@ impl Filesystem for PlexHotCacheFs {
 
         // Emit access event for the predictor (fire-and-forget).
         if let Some(ref tx) = self.access_tx {
+            if self.is_quiet(&path) {
+                tracing::debug!("plex access: {:?}", path);
+            } else {
+                tracing::info!("plex access: {:?}", path);
+            }
             let _ = tx.send(AccessEvent {
                 relative_path: path.clone(),
-                timestamp: std::time::SystemTime::now(),
             });
         }
 
@@ -261,7 +272,11 @@ impl Filesystem for PlexHotCacheFs {
                     let c = path_to_cstring_abs(&cache_path);
                     let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY) };
                     if fd >= 0 {
-                        tracing::debug!("open ino={} path={:?} => cache hit fd={}", ino.0, path, fd);
+                        if self.is_quiet(&path) {
+                            tracing::debug!("cache HIT: {:?} (serving from SSD)", path);
+                        } else {
+                            tracing::info!("cache HIT: {:?} (serving from SSD)", path);
+                        }
                         reply.opened(FileHandle(fd as u64), FopenFlags::empty());
                         return;
                     }
@@ -280,7 +295,11 @@ impl Filesystem for PlexHotCacheFs {
             return;
         }
 
-        tracing::debug!("open ino={} path={:?} fd={}", ino.0, path, fd);
+        if self.is_quiet(&path) {
+            tracing::debug!("cache MISS: {:?} (serving from backing store)", path);
+        } else {
+            tracing::info!("cache MISS: {:?} (serving from backing store)", path);
+        }
         reply.opened(FileHandle(fd as u64), FopenFlags::empty());
     }
 

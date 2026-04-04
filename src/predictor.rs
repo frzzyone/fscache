@@ -5,7 +5,6 @@ use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::SystemTime;
 
 use regex::Regex;
 use tokio::sync::mpsc;
@@ -16,7 +15,6 @@ use crate::scheduler::Scheduler;
 
 pub struct AccessEvent {
     pub relative_path: PathBuf,
-    pub timestamp: SystemTime,
 }
 
 pub struct CopyRequest {
@@ -51,14 +49,24 @@ impl Predictor {
         let mut in_flight: HashSet<PathBuf> = HashSet::new();
 
         while let Some(event) = self.rx.recv().await {
+            tracing::debug!("predictor: received access event for {:?}", event.relative_path);
+
             if !self.scheduler.is_caching_allowed() {
-                tracing::debug!("predictor: outside caching window, skipping");
+                tracing::debug!("predictor: outside caching window, skipping {:?}", event.relative_path);
                 continue;
             }
 
             let next = self.find_next_episodes(&event.relative_path);
+            if next.is_empty() {
+                tracing::debug!("predictor: no upcoming episodes found for {:?}", event.relative_path);
+            }
             for rel in next {
-                if self.cache.is_cached(&rel) || in_flight.contains(&rel) {
+                if self.cache.is_cached(&rel) {
+                    tracing::debug!("predictor: {} already cached, skipping", rel.display());
+                    continue;
+                }
+                if in_flight.contains(&rel) {
+                    tracing::debug!("predictor: {} already in-flight, skipping", rel.display());
                     continue;
                 }
                 let cache_dest = self.cache.cache_path(&rel);
@@ -73,10 +81,24 @@ impl Predictor {
         if let Some(ref db) = self.plex_db {
             let found = db.next_episodes(rel_path, self.lookahead);
             if !found.is_empty() {
+                tracing::info!(
+                    "predictor: Plex DB found {} upcoming episode(s) after {:?}",
+                    found.len(),
+                    rel_path
+                );
                 return found;
             }
+            tracing::debug!("predictor: Plex DB returned no results for {:?}, trying regex", rel_path);
         }
-        self.regex_fallback(rel_path)
+        let found = self.regex_fallback(rel_path);
+        if !found.is_empty() {
+            tracing::info!(
+                "predictor: regex found {} upcoming episode(s) after {:?}",
+                found.len(),
+                rel_path
+            );
+        }
+        found
     }
 
     fn regex_fallback(&self, rel_path: &Path) -> Vec<PathBuf> {
@@ -90,23 +112,91 @@ impl Predictor {
         };
         let dir = rel_path.parent().unwrap_or(Path::new(""));
 
+        // Phase 1: same-season, higher-episode files in the current directory.
         let entries = list_backing_dir(self.backing_fd, dir);
-
-        let mut candidates: Vec<(u32, PathBuf)> = entries
+        let mut candidates: Vec<(u32, u32, PathBuf)> = entries
             .into_iter()
             .filter_map(|entry_name| {
                 let s = entry_name.to_string_lossy();
                 let (s_num, e_num) = parse_season_episode(&s)?;
-                if s_num == season && e_num > episode && e_num <= episode + self.lookahead as u32 {
-                    Some((e_num, dir.join(&*entry_name)))
+                if s_num == season && e_num > episode {
+                    Some((s_num, e_num, dir.join(&*entry_name)))
                 } else {
                     None
                 }
             })
             .collect();
+        candidates.sort_by_key(|(s, e, _)| (*s, *e));
+        candidates.truncate(self.lookahead);
 
-        candidates.sort_by_key(|(e, _)| *e);
-        candidates.into_iter().take(self.lookahead).map(|(_, p)| p).collect()
+        // Phase 2: cross-season, if we still need more episodes.
+        if candidates.len() < self.lookahead {
+            let needed = self.lookahead - candidates.len();
+            let parent_dir_name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+
+            if parse_season_dir(&parent_dir_name).is_some() {
+                // Structured layout: Season X folders under a show directory.
+                // Go up one level to the show directory and find subsequent season folders.
+                let show_dir = dir.parent().unwrap_or(Path::new(""));
+                let show_entries = list_backing_dir(self.backing_fd, show_dir);
+
+                let mut next_seasons: Vec<(u32, PathBuf)> = show_entries
+                    .into_iter()
+                    .filter_map(|entry_name| {
+                        let s_num = parse_season_dir(&entry_name.to_string_lossy())?;
+                        if s_num > season {
+                            Some((s_num, show_dir.join(&*entry_name)))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                next_seasons.sort_by_key(|(s, _)| *s);
+
+                'outer: for (_, season_dir) in next_seasons {
+                    let season_entries = list_backing_dir(self.backing_fd, &season_dir);
+                    let mut eps: Vec<(u32, u32, PathBuf)> = season_entries
+                        .into_iter()
+                        .filter_map(|entry_name| {
+                            let s = entry_name.to_string_lossy();
+                            let (s_num, e_num) = parse_season_episode(&s)?;
+                            Some((s_num, e_num, season_dir.join(&*entry_name)))
+                        })
+                        .collect();
+                    eps.sort_by_key(|(s, e, _)| (*s, *e));
+                    for ep in eps {
+                        if candidates.len() >= self.lookahead {
+                            break 'outer;
+                        }
+                        candidates.push(ep);
+                    }
+                }
+            } else {
+                // Flat layout: all seasons in one directory. Scan for higher-season episodes.
+                let flat_entries = list_backing_dir(self.backing_fd, dir);
+                let mut flat_candidates: Vec<(u32, u32, PathBuf)> = flat_entries
+                    .into_iter()
+                    .filter_map(|entry_name| {
+                        let s = entry_name.to_string_lossy();
+                        let (s_num, e_num) = parse_season_episode(&s)?;
+                        if s_num > season {
+                            Some((s_num, e_num, dir.join(&*entry_name)))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                flat_candidates.sort_by_key(|(s, e, _)| (*s, *e));
+                for ep in flat_candidates.into_iter().take(needed) {
+                    candidates.push(ep);
+                }
+            }
+        }
+
+        candidates.into_iter().take(self.lookahead).map(|(_, _, p)| p).collect()
     }
 }
 
@@ -151,15 +241,26 @@ pub async fn run_copier_task(
 // ---- helpers ----
 
 static SEASON_EP_RE: OnceLock<Regex> = OnceLock::new();
+static SEASON_DIR_RE: OnceLock<Regex> = OnceLock::new();
 
 fn season_ep_re() -> &'static Regex {
     SEASON_EP_RE.get_or_init(|| Regex::new(r"(?i)[Ss](\d{1,2})[Ee](\d{1,3})").unwrap())
+}
+
+fn season_dir_re() -> &'static Regex {
+    SEASON_DIR_RE.get_or_init(|| Regex::new(r"(?i)^Season\s+0*(\d+)$").unwrap())
 }
 
 /// Parse season and episode number from a filename containing SxxExx.
 pub fn parse_season_episode(name: &str) -> Option<(u32, u32)> {
     let cap = season_ep_re().captures(name)?;
     Some((cap[1].parse().ok()?, cap[2].parse().ok()?))
+}
+
+/// Parse a season number from a directory name like "Season 1", "Season 01", "season 3".
+pub fn parse_season_dir(name: &str) -> Option<u32> {
+    let cap = season_dir_re().captures(name)?;
+    cap[1].parse().ok()
 }
 
 /// List filenames in a directory relative to `backing_fd`.
