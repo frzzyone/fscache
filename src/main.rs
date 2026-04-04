@@ -37,7 +37,6 @@ async fn main() -> anyhow::Result<()> {
         None => config::load()?,
     };
 
-    // Set up layered tracing: console (colored, info-level) + rolling file (debug-level).
     let console_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&config.logging.console_level));
 
@@ -77,7 +76,6 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("passthrough_mode = true — cache is bypassed, acting as pure proxy");
     }
 
-    // Ensure cache directory exists
     std::fs::create_dir_all(&config.paths.cache_directory)?;
 
     let target = PathBuf::from(&config.paths.target_directory);
@@ -85,12 +83,16 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("target_directory does not exist: {}", target.display());
     }
 
-    // Open O_PATH fd to target BEFORE mounting FUSE over it
+    // Must open O_PATH fd BEFORE mounting FUSE over the target directory.
     let mut fs = fuse_fs::PlexHotCacheFs::new(&target)?;
     fs.passthrough_mode = config.cache.passthrough_mode;
     fs.repeat_log_window = std::time::Duration::from_secs(config.logging.repeat_log_window_secs);
+    fs.trigger_strategy = match config.cache.trigger_strategy.as_str() {
+        "rolling-buffer" => fuse_fs::TriggerStrategy::RollingBuffer,
+        _ => fuse_fs::TriggerStrategy::CacheMissOnly,
+    };
+    tracing::info!("Trigger strategy: {}", config.cache.trigger_strategy);
 
-    // Set up SSD cache overlay.
     let cache_manager = Arc::new(cache::CacheManager::new(
         PathBuf::from(&config.paths.cache_directory),
         config.cache.max_size_gb,
@@ -100,7 +102,6 @@ async fn main() -> anyhow::Result<()> {
     cache_manager.startup_cleanup();
     fs.cache = Some(Arc::clone(&cache_manager));
 
-    // Set up prediction pipeline.
     let scheduler = scheduler::Scheduler::new(
         &config.schedule.cache_window_start,
         &config.schedule.cache_window_end,
@@ -166,7 +167,6 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Mount active. Waiting for shutdown signal...");
 
-    // Wait for SIGTERM or Ctrl-C
     let mut sigterm = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),
     )?;

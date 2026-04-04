@@ -1,12 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-/// Manages the SSD cache directory.
-///
-/// - No persistent database; uses filesystem timestamps exclusively.
-/// - `.partial` files are invisible to FUSE and cleaned up on startup.
-/// - Eviction: delete files older than `expiry_hours`, then by oldest atime
-///   until under `max_size_bytes`.
+/// No persistent database — uses filesystem timestamps exclusively.
 pub struct CacheManager {
     cache_dir: PathBuf,
     max_size_bytes: u64,
@@ -51,18 +46,15 @@ impl CacheManager {
         cm
     }
 
-    /// Path where a cached copy of `rel_path` would live.
     pub fn cache_path(&self, rel_path: &Path) -> PathBuf {
         self.cache_dir.join(rel_path)
     }
 
-    /// Returns true if a complete cached copy exists (not .partial).
     pub fn is_cached(&self, rel_path: &Path) -> bool {
         let p = self.cache_path(rel_path);
         p.exists() && !p.extension().map_or(false, |e| e == "partial")
     }
 
-    /// Delete all `.partial` files left over from interrupted copies.
     pub fn startup_cleanup(&self) {
         let removed = remove_partials(&self.cache_dir);
         let existing = collect_cache_files(&self.cache_dir);
@@ -78,15 +70,12 @@ impl CacheManager {
         );
     }
 
-    /// Evict expired files, then enforce max size.
-    /// Call before starting a new copy or on the periodic janitor tick.
     pub fn evict_if_needed(&self) {
         let now = SystemTime::now();
         let mut expiry_count = 0u32;
         let mut size_count = 0u32;
         let mut reclaimed_bytes = 0u64;
 
-        // Phase 1 of eviction: delete files past expiry_hours.
         let mut all = collect_cache_files(&self.cache_dir);
         all.retain(|entry| {
             if let Some(age) = mtime_age(entry, now) {
@@ -105,7 +94,6 @@ impl CacheManager {
             true
         });
 
-        // Phase 2: enforce max_size_bytes — delete by oldest atime first.
         let mut total: u64 = all
             .iter()
             .filter_map(|p| std::fs::metadata(p).ok())
@@ -123,7 +111,6 @@ impl CacheManager {
             return;
         }
 
-        // Sort by atime ascending (oldest first).
         all.sort_by_key(|p| {
             std::fs::metadata(p)
                 .and_then(|m| m.accessed())
@@ -155,7 +142,6 @@ impl CacheManager {
         }
     }
 
-    /// True if the underlying filesystem has enough free space to allow a copy.
     pub fn has_free_space(&self) -> bool {
         free_space_bytes(&self.cache_dir)
             .map(|free| free >= self.min_free_bytes)
@@ -184,7 +170,6 @@ fn remove_partials(dir: &Path) -> u32 {
     count
 }
 
-/// Recursively collect all regular (non-.partial) files under `dir`.
 fn collect_cache_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     collect_inner(dir, &mut out);
@@ -210,7 +195,6 @@ fn mtime_age(path: &Path, now: SystemTime) -> Option<Duration> {
 }
 
 fn free_space_bytes(path: &Path) -> Option<u64> {
-    // Use statvfs to get available bytes on the filesystem containing `path`.
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c = CString::new(path.as_os_str().as_bytes()).ok()?;

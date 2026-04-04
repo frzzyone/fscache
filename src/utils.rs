@@ -1,7 +1,6 @@
 use anyhow::Context;
 use std::path::PathBuf;
 
-/// Find a named file by checking next to the running binary first, then the current directory.
 pub fn find_file_near_binary(filename: &str) -> anyhow::Result<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {

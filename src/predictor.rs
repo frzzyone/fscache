@@ -139,7 +139,6 @@ impl Predictor {
 
             if parse_season_dir(&parent_dir_name).is_some() {
                 // Structured layout: Season X folders under a show directory.
-                // Go up one level to the show directory and find subsequent season folders.
                 let show_dir = dir.parent().unwrap_or(Path::new(""));
                 let show_entries = list_backing_dir(self.backing_fd, show_dir);
 
@@ -200,7 +199,6 @@ impl Predictor {
     }
 }
 
-/// Copier task: processes CopyRequests one at a time.
 pub async fn run_copier_task(
     backing_fd: RawFd,
     mut rx: mpsc::Receiver<CopyRequest>,
@@ -251,19 +249,16 @@ fn season_dir_re() -> &'static Regex {
     SEASON_DIR_RE.get_or_init(|| Regex::new(r"(?i)^Season\s+0*(\d+)$").unwrap())
 }
 
-/// Parse season and episode number from a filename containing SxxExx.
 pub fn parse_season_episode(name: &str) -> Option<(u32, u32)> {
     let cap = season_ep_re().captures(name)?;
     Some((cap[1].parse().ok()?, cap[2].parse().ok()?))
 }
 
-/// Parse a season number from a directory name like "Season 1", "Season 01", "season 3".
 pub fn parse_season_dir(name: &str) -> Option<u32> {
     let cap = season_dir_re().captures(name)?;
     cap[1].parse().ok()
 }
 
-/// List filenames in a directory relative to `backing_fd`.
 fn list_backing_dir(backing_fd: RawFd, rel_dir: &Path) -> Vec<std::ffi::OsString> {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;

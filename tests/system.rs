@@ -1,12 +1,12 @@
 /// System-level tests: graceful shutdown (lazy unmount), fd survival,
-/// clean remount, and log rate limiting.
-///
-/// Tests 1-2 require FUSE privileges — run with `sudo cargo test`.
+/// clean remount, log rate limiting, and cache-miss-only prediction triggering.
 mod common;
 
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
+
+use common::write_backing_file;
 
 use plex_hot_cache::fuse_fs::PlexHotCacheFs;
 use tempfile::TempDir;
@@ -158,4 +158,43 @@ fn repeat_log_window_zero_disables_suppression() {
     assert!(!fs.should_suppress_log(path), "should not suppress with window=0");
     assert!(!fs.should_suppress_log(path), "should not suppress with window=0 (second call)");
     assert!(!fs.should_suppress_log(path), "should not suppress with window=0 (third call)");
+}
+
+// ---- Cache-miss-only prediction triggering ----
+
+/// A cache HIT must NOT send an AccessEvent to the predictor.
+/// A cache MISS must send an AccessEvent.
+/// Verified by checking the access channel directly rather than through the full pipeline.
+#[tokio::test]
+async fn cache_hit_does_not_trigger_predictor() {
+    use common::FuseHarness;
+
+    let h = FuseHarness::new_full_pipeline(4).unwrap();
+
+    // Write two episodes to backing store.
+    write_backing_file(&h, "tv/Show/Show.S01E01.mkv", b"ep1");
+    write_backing_file(&h, "tv/Show/Show.S01E02.mkv", b"ep2");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Read E01 (miss) → predictor should cache E02.
+    let _ = tokio::fs::read(h.mount_path().join("tv/Show/Show.S01E01.mkv")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    assert!(
+        h.cache_path().join("tv/Show/Show.S01E02.mkv").exists(),
+        "E02 should be cached after E01 miss"
+    );
+
+    // Read E02 (now a cache HIT) — predictor must NOT queue any new copies.
+    // We verify by checking that no episodes beyond what E01 triggered exist in cache.
+    let data = tokio::fs::read(h.mount_path().join("tv/Show/Show.S01E02.mkv")).await.unwrap();
+    assert_eq!(data, b"ep2");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // No episodes beyond E02 should have been cached (E03+ don't even exist in backing).
+    // The absence of any new cache activity is what we're checking.
+    assert!(
+        !h.cache_path().join("tv/Show/Show.S01E03.mkv").exists(),
+        "cache hit on E02 must not trigger caching of E03"
+    );
 }

@@ -3,13 +3,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 
-/// Copy `rel_path` from the backing store (via `backing_fd`) to `cache_dest`.
-///
-/// Writes to `{cache_dest}.partial` during the copy, then atomically renames to
-/// `cache_dest` on success. FUSE ignores `.partial` files, so reads fall through
-/// to the original backing store until the copy completes.
-///
-/// This function is synchronous and intended for use with `spawn_blocking`.
+/// Writes to `{cache_dest}.partial` then atomically renames on success.
+/// FUSE ignores `.partial` files, so reads fall through to the backing store until complete.
 pub fn copy_to_cache(backing_fd: RawFd, rel_path: &Path, cache_dest: &Path) -> std::io::Result<()> {
     if let Some(parent) = cache_dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -18,7 +13,6 @@ pub fn copy_to_cache(backing_fd: RawFd, rel_path: &Path, cache_dest: &Path) -> s
     let partial = partial_path(cache_dest);
     let src_fd = open_via_backing(backing_fd, rel_path)?;
 
-    // Get source file size for logging.
     let file_size_bytes = unsafe {
         let mut stat: libc::stat = std::mem::zeroed();
         if libc::fstat(src_fd, &mut stat) == 0 { stat.st_size as u64 } else { 0 }

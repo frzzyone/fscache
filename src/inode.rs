@@ -12,8 +12,6 @@ struct InodeEntry {
 }
 
 /// Bidirectional map between FUSE inode numbers and relative file paths.
-///
-/// Inode 1 is always the root, mapped to an empty path ("").
 pub struct InodeTable {
     by_ino: HashMap<u64, InodeEntry>,
     by_path: HashMap<PathBuf, u64>,
@@ -43,17 +41,14 @@ impl InodeTable {
         INodeNo(ROOT_INO)
     }
 
-    /// Relative path for an inode, or None if not found.
     pub fn get_path(&self, ino: u64) -> Option<&Path> {
         self.by_ino.get(&ino).map(|e| e.path.as_path())
     }
 
-    /// Inode for a path, if already allocated.
     pub fn get_path_ino(&self, path: &Path) -> Option<u64> {
         self.by_path.get(path).copied()
     }
 
-    /// Get or allocate an inode for a path, incrementing its refcount.
     pub fn get_or_create(&mut self, path: &Path) -> u64 {
         if let Some(&ino) = self.by_path.get(path) {
             self.by_ino.get_mut(&ino).unwrap().refcount =

@@ -41,6 +41,9 @@ pub struct CacheConfig {
     pub min_free_space_gb: f64,
     #[serde(default)]
     pub passthrough_mode: bool,
+    /// When to notify the predictor. "cache-miss-only" (default) or "rolling-buffer".
+    #[serde(default = "default_trigger_strategy")]
+    pub trigger_strategy: String,
 }
 
 impl Default for CacheConfig {
@@ -51,6 +54,7 @@ impl Default for CacheConfig {
             expiry_hours: default_expiry_hours(),
             min_free_space_gb: default_min_free_space_gb(),
             passthrough_mode: false,
+            trigger_strategy: default_trigger_strategy(),
         }
     }
 }
@@ -106,6 +110,7 @@ fn default_repeat_log_window_secs() -> u64 { 60 }
 fn default_plex_db_path() -> String {
     "/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db".to_string()
 }
+fn default_trigger_strategy() -> String { "cache-miss-only".to_string() }
 fn default_max_size_gb() -> f64 { 200.0 }
 fn default_lookahead() -> usize { 4 }
 fn default_expiry_hours() -> u64 { 72 }

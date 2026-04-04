@@ -29,22 +29,18 @@ impl PlexDb {
         Ok(Self { conn, target_dir: target_dir.to_path_buf() })
     }
 
-    /// Open an in-memory database. Used in integration tests.
     #[allow(dead_code)]
     pub fn open_in_memory(target_dir: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory()?;
         Ok(Self { conn, target_dir: target_dir.to_path_buf() })
     }
 
-    /// Execute arbitrary SQL. Used in integration tests to populate schema/data.
     #[allow(dead_code)]
     pub fn exec(&self, sql: &str) -> anyhow::Result<()> {
         self.conn.execute_batch(sql)?;
         Ok(())
     }
 
-    /// Return up to `lookahead` relative paths for episodes that come after `rel_path`.
-    /// Searches the same season first, then subsequent seasons.
     pub fn next_episodes(&self, rel_path: &Path, lookahead: usize) -> Vec<PathBuf> {
         if lookahead == 0 {
             return vec![];
@@ -61,11 +57,9 @@ impl PlexDb {
 
         let mut result = Vec::new();
 
-        // Same season, higher episode index
         let same = self.episodes_after(info.season_id, info.episode_index, lookahead);
         result.extend(same);
 
-        // Cross-season if we still need more
         if result.len() < lookahead {
             let season_idx = self.season_index(info.season_id).unwrap_or(0);
             for next_season_id in self.seasons_after(info.show_id, season_idx) {

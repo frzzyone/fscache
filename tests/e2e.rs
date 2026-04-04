@@ -82,11 +82,58 @@ async fn full_pipeline_caches_and_serves_from_ssd() {
     }
 }
 
-/// Accessing a second episode triggers prediction of the episodes following it,
-/// without re-caching episodes that are already cached.
+/// Cache hits do NOT trigger further prediction. Only misses advance the lookahead.
+/// E01 miss → caches E02+E03. Reading E02 (hit) → no new caching. E04 miss → caches E05+E06.
 #[tokio::test]
 async fn pipeline_advances_lookahead_on_each_access() {
     let h = FuseHarness::new_full_pipeline(2).unwrap(); // lookahead = 2
+
+    for i in 1..=6u32 {
+        write_backing_file(
+            &h,
+            &format!("tv/Show/Show.S01E0{}.mkv", i),
+            format!("ep{}", i).as_bytes(),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Access E01 (miss) → should cache E02 and E03
+    let _ = tokio::fs::read(h.mount_path().join("tv/Show/Show.S01E01.mkv"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    assert!(h.cache_path().join("tv/Show/Show.S01E02.mkv").exists(), "E02 should be cached after E01 miss");
+    assert!(h.cache_path().join("tv/Show/Show.S01E03.mkv").exists(), "E03 should be cached after E01 miss");
+    assert!(!h.cache_path().join("tv/Show/Show.S01E04.mkv").exists(), "E04 should NOT be cached yet");
+
+    // Access E02 (cache HIT) → should NOT trigger any new caching
+    let e2_data = tokio::fs::read(h.mount_path().join("tv/Show/Show.S01E02.mkv"))
+        .await
+        .unwrap();
+    assert_eq!(e2_data, b"ep2");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    assert!(!h.cache_path().join("tv/Show/Show.S01E04.mkv").exists(), "E04 should NOT be cached after a cache hit");
+
+    // Access E04 (miss) → should cache E05 and E06
+    let _ = tokio::fs::read(h.mount_path().join("tv/Show/Show.S01E04.mkv"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    assert!(h.cache_path().join("tv/Show/Show.S01E05.mkv").exists(), "E05 should be cached after E04 miss");
+    assert!(h.cache_path().join("tv/Show/Show.S01E06.mkv").exists(), "E06 should be cached after E04 miss");
+}
+
+/// Rolling-buffer strategy fires on every access, including cache hits.
+/// E01 miss → caches E02+E03. E02 hit → triggers prediction again → caches E04+E05.
+#[tokio::test]
+async fn rolling_buffer_triggers_on_cache_hit() {
+    use common::FuseHarness;
+    use plex_hot_cache::fuse_fs::TriggerStrategy;
+
+    let h = FuseHarness::new_full_pipeline_with_strategy(2, TriggerStrategy::RollingBuffer).unwrap();
 
     for i in 1..=5u32 {
         write_backing_file(
@@ -97,37 +144,27 @@ async fn pipeline_advances_lookahead_on_each_access() {
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Access E01 → should cache E02 and E03
+    // Access E01 (miss) → should cache E02 and E03
     let _ = tokio::fs::read(h.mount_path().join("tv/Show/Show.S01E01.mkv"))
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(600)).await;
 
-    assert!(
-        h.cache_path().join("tv/Show/Show.S01E02.mkv").exists(),
-        "E02 should be cached after accessing E01"
-    );
-    assert!(
-        h.cache_path().join("tv/Show/Show.S01E03.mkv").exists(),
-        "E03 should be cached after accessing E01"
-    );
-    assert!(
-        !h.cache_path().join("tv/Show/Show.S01E04.mkv").exists(),
-        "E04 should NOT be cached yet (outside lookahead=2)"
-    );
+    assert!(h.cache_path().join("tv/Show/Show.S01E02.mkv").exists(), "E02 should be cached after E01 miss");
+    assert!(h.cache_path().join("tv/Show/Show.S01E03.mkv").exists(), "E03 should be cached after E01 miss");
+    assert!(!h.cache_path().join("tv/Show/Show.S01E04.mkv").exists(), "E04 should not be cached yet");
 
-    // Access E02 through FUSE (serves from cache) → should cache E04 (E03 already cached)
+    // Access E02 (cache HIT) — rolling-buffer fires an event, so E04+E05 should get cached
     let e2_data = tokio::fs::read(h.mount_path().join("tv/Show/Show.S01E02.mkv"))
         .await
         .unwrap();
     assert_eq!(e2_data, b"ep2");
-
     tokio::time::sleep(Duration::from_millis(600)).await;
 
-    assert!(
-        h.cache_path().join("tv/Show/Show.S01E04.mkv").exists(),
-        "E04 should be cached after accessing E02"
-    );
+    // Predictor finds [E03, E04] after E02. E03 is already cached so it's skipped;
+    // E04 is the new cache target. E05 is outside the lookahead window.
+    assert!(h.cache_path().join("tv/Show/Show.S01E04.mkv").exists(), "E04 should be cached after E02 hit (rolling-buffer)");
+    assert!(!h.cache_path().join("tv/Show/Show.S01E05.mkv").exists(), "E05 is outside lookahead range");
 }
 
 /// True overmount E2E: FUSE is mounted ON TOP of the same directory the media

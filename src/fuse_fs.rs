@@ -20,26 +20,28 @@ use crate::predictor::AccessEvent;
 /// Short TTL so the kernel re-checks after a cache file appears.
 const TTL: Duration = Duration::from_secs(1);
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TriggerStrategy {
+    /// Fire an AccessEvent only on a cache miss. Hits mean lookahead is working.
+    CacheMissOnly,
+    /// Fire an AccessEvent on every access, keeping the lookahead window topped up.
+    RollingBuffer,
+}
+
 pub struct PlexHotCacheFs {
     /// O_PATH fd opened to target_directory *before* the FUSE overmount.
-    /// All backing-store access uses openat(backing_fd, relative_path, ...).
     pub backing_fd: RawFd,
     inodes: Arc<Mutex<InodeTable>>,
     pub passthrough_mode: bool,
-    /// Optional SSD cache overlay.  When set, `open()` checks this directory
-    /// first and serves cached files from SSD when available.
     pub cache: Option<Arc<CacheManager>>,
-    /// Channel to send access events to the predictor task.
     pub access_tx: Option<tokio::sync::mpsc::UnboundedSender<AccessEvent>>,
-    /// How long to suppress repeated access/hit/miss logs for the same file path.
     pub repeat_log_window: Duration,
-    /// Tracks the last time each file path was logged at INFO level.
+    pub trigger_strategy: TriggerStrategy,
     recent_logs: Mutex<HashMap<PathBuf, Instant>>,
 }
 
 impl PlexHotCacheFs {
-    /// Opens an O_PATH fd to `backing_path`.
-    /// MUST be called before mounting FUSE over that path.
+    /// MUST be called before mounting FUSE over `backing_path`.
     pub fn new(backing_path: &Path) -> anyhow::Result<Self> {
         let c_path = CString::new(backing_path.as_os_str().as_bytes())
             .map_err(|_| anyhow::anyhow!("invalid backing path"))?;
@@ -63,6 +65,7 @@ impl PlexHotCacheFs {
             cache: None,
             access_tx: None,
             repeat_log_window: Duration::from_secs(60),
+            trigger_strategy: TriggerStrategy::CacheMissOnly,
             recent_logs: Mutex::new(HashMap::new()),
         })
     }
@@ -89,8 +92,6 @@ impl PlexHotCacheFs {
 
     // ---- backing store helpers ----
 
-    /// Stat a relative path against the backing fd.
-    /// Empty path stats the backing fd itself (the root directory).
     fn stat_backing(&self, rel_path: &Path) -> Option<libc::stat> {
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         let rc = if rel_path == Path::new("") {
@@ -132,8 +133,6 @@ impl PlexHotCacheFs {
         }
     }
 
-    /// Read all directory entries via the directory fd.
-    /// Returns (name, ino, kind) including "." and "..".
     fn list_dir_entries(
         &self,
         dir_fd: RawFd,
@@ -144,7 +143,6 @@ impl PlexHotCacheFs {
 
         let mut entries: Vec<(OsString, u64, FileType)> = Vec::new();
 
-        // "." and ".."
         let dot_ino = self.inodes.lock().unwrap()
             .get_path_ino(parent_path)
             .unwrap_or(InodeTable::root_ino().0);
@@ -261,7 +259,6 @@ impl Filesystem for PlexHotCacheFs {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        // Reject write operations — this is a read-only filesystem
         if flags.acc_mode() != fuser::OpenAccMode::O_RDONLY {
             reply.error(Errno::EACCES);
             return;
@@ -272,22 +269,20 @@ impl Filesystem for PlexHotCacheFs {
             None => { reply.error(Errno::ENOENT); return; }
         };
 
-        // Determine once whether this path's logs should be suppressed (repeated within window).
         let suppress = self.should_suppress_log(&path);
 
-        // Emit access event for the predictor (fire-and-forget).
-        if let Some(ref tx) = self.access_tx {
-            if suppress {
-                tracing::debug!("plex access: {:?}", path);
-            } else {
-                tracing::info!("plex access: {:?}", path);
+        // RollingBuffer: notify predictor on every access before the cache check.
+        if self.trigger_strategy == TriggerStrategy::RollingBuffer {
+            if let Some(ref tx) = self.access_tx {
+                if suppress {
+                    tracing::debug!("plex access: {:?}", path);
+                } else {
+                    tracing::info!("plex access: {:?}", path);
+                }
+                let _ = tx.send(AccessEvent { relative_path: path.clone() });
             }
-            let _ = tx.send(AccessEvent {
-                relative_path: path.clone(),
-            });
         }
 
-        // Cache overlay: serve from SSD if a complete cached copy exists.
         if !self.passthrough_mode {
             if let Some(ref cache) = self.cache {
                 if cache.is_cached(&path) {
@@ -309,7 +304,6 @@ impl Filesystem for PlexHotCacheFs {
             }
         }
 
-        // Backing store passthrough.
         let c_path = path_to_cstring(&path);
         let fd = unsafe { libc::openat(self.backing_fd, c_path.as_ptr(), libc::O_RDONLY) };
 
@@ -323,6 +317,14 @@ impl Filesystem for PlexHotCacheFs {
         } else {
             tracing::info!("cache MISS: {:?} (serving from backing store)", path);
         }
+
+        // CacheMissOnly: notify predictor only on miss — hits mean lookahead is working.
+        if self.trigger_strategy == TriggerStrategy::CacheMissOnly {
+            if let Some(ref tx) = self.access_tx {
+                let _ = tx.send(AccessEvent { relative_path: path.clone() });
+            }
+        }
+
         reply.opened(FileHandle(fd as u64), FopenFlags::empty());
     }
 
@@ -411,10 +413,10 @@ impl Filesystem for PlexHotCacheFs {
         for (i, (name, entry_ino, kind)) in entries.iter().enumerate() {
             let next_offset = (i + 1) as u64;
             if next_offset <= offset {
-                continue; // already returned in a prior readdir call
+                continue;
             }
             if reply.add(INodeNo(*entry_ino), next_offset, *kind, name) {
-                break; // reply buffer full
+                break;
             }
         }
 

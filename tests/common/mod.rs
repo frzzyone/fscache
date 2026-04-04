@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use fuser::{MountOption, SessionACL};
 use plex_hot_cache::cache::CacheManager;
-use plex_hot_cache::fuse_fs::PlexHotCacheFs;
+use plex_hot_cache::fuse_fs::{PlexHotCacheFs, TriggerStrategy};
 use plex_hot_cache::predictor::{run_copier_task, AccessEvent, CopyRequest, Predictor};
 use plex_hot_cache::scheduler::Scheduler;
 use tempfile::TempDir;
@@ -96,11 +96,16 @@ impl FuseHarness {
     /// The predictor/copier tasks are spawned on the current tokio runtime — call this
     /// from inside `#[tokio::test]`.
     pub fn new_full_pipeline(lookahead: usize) -> anyhow::Result<Self> {
+        Self::new_full_pipeline_with_strategy(lookahead, TriggerStrategy::CacheMissOnly)
+    }
+
+    pub fn new_full_pipeline_with_strategy(lookahead: usize, strategy: TriggerStrategy) -> anyhow::Result<Self> {
         let backing = TempDir::new()?;
         let mount = TempDir::new()?;
         let cache_dir = TempDir::new()?;
 
         let mut fs = PlexHotCacheFs::new(backing.path())?;
+        fs.trigger_strategy = strategy;
         let backing_fd = fs.backing_fd;
 
         let cache_mgr = Arc::new(CacheManager::new(

@@ -13,13 +13,11 @@ impl Scheduler {
         })
     }
 
-    /// Returns true if caching is currently allowed (uses real local time).
     pub fn is_caching_allowed(&self) -> bool {
         let (h, m) = local_hm();
         self.is_allowed_at(h, m)
     }
 
-    /// Testable version: check a specific (hour, minute).
     pub fn is_allowed_at(&self, h: u8, m: u8) -> bool {
         let now = h as u32 * 60 + m as u32;
         let start = self.start.0 as u32 * 60 + self.start.1 as u32;
