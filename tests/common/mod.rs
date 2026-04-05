@@ -99,6 +99,58 @@ impl FuseHarness {
         Self::new_full_pipeline_with_strategy(lookahead, TriggerStrategy::CacheMissOnly)
     }
 
+    /// Full pipeline with a non-zero playback detection threshold.
+    /// Use this to test that prediction is suppressed for short reads and fires
+    /// only after `threshold` seconds of sustained reading.
+    pub fn new_full_pipeline_with_threshold(lookahead: usize, threshold: std::time::Duration) -> anyhow::Result<Self> {
+        let backing = TempDir::new()?;
+        let mount = TempDir::new()?;
+        let cache_dir = TempDir::new()?;
+
+        let mut fs = PlexHotCacheFs::new(backing.path())?;
+        fs.playback_threshold = threshold;
+        let backing_fd = fs.backing_fd;
+
+        let cache_mgr = Arc::new(CacheManager::new(
+            cache_dir.path().to_path_buf(),
+            cache_dir.path().to_path_buf(),
+            1.0,
+            72,
+            0.0,
+        ));
+        cache_mgr.startup_cleanup();
+        fs.cache = Some(Arc::clone(&cache_mgr));
+
+        let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
+        let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(64);
+        fs.access_tx = Some(access_tx);
+
+        let scheduler = Scheduler::new("00:00", "23:59").unwrap();
+        let predictor = Predictor::new(
+            access_rx,
+            copy_tx,
+            Arc::clone(&cache_mgr),
+            lookahead,
+            None,
+            scheduler,
+            backing_fd,
+            0,
+            cache_dir.path().to_path_buf(),
+            0,
+        );
+        tokio::spawn(predictor.run());
+        tokio::spawn(run_copier_task(backing_fd, copy_rx, Arc::clone(&cache_mgr)));
+
+        let session = fuser::spawn_mount2(fs, mount.path(), &test_fuse_config())?;
+
+        Ok(Self {
+            backing,
+            mount,
+            cache: Some(cache_dir),
+            _session: session,
+        })
+    }
+
     pub fn new_full_pipeline_with_strategy(lookahead: usize, strategy: TriggerStrategy) -> anyhow::Result<Self> {
         let backing = TempDir::new()?;
         let mount = TempDir::new()?;

@@ -50,6 +50,11 @@ pub struct CacheConfig {
     /// Discard persisted deferred events older than this many minutes on startup (default 1440 = 24h).
     #[serde(default = "default_deferred_ttl_minutes")]
     pub deferred_ttl_minutes: u64,
+    /// Seconds a file must be actively read before triggering lookahead prediction.
+    /// Filters out Plex Media Scanner's sub-second header probes from real user playback.
+    /// Set to 0 to fire immediately on open() (legacy behavior, good for tests).
+    #[serde(default)]
+    pub playback_threshold_secs: u64,
 }
 
 impl Default for CacheConfig {
@@ -63,6 +68,7 @@ impl Default for CacheConfig {
             trigger_strategy: default_trigger_strategy(),
             max_cache_pull_per_mount_gb: 0.0,
             deferred_ttl_minutes: default_deferred_ttl_minutes(),
+            playback_threshold_secs: 0,
         }
     }
 }

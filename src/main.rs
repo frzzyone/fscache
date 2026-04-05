@@ -88,6 +88,9 @@ async fn main() -> anyhow::Result<()> {
         _ => fuse_fs::TriggerStrategy::CacheMissOnly,
     };
     tracing::info!("Trigger strategy: {}", config.cache.trigger_strategy);
+    if config.cache.playback_threshold_secs > 0 {
+        tracing::info!("Playback detection threshold: {}s", config.cache.playback_threshold_secs);
+    }
     tracing::info!(
         "Schedule: caching allowed {} to {}",
         config.schedule.cache_window_start,
@@ -129,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
         fs.passthrough_mode = config.cache.passthrough_mode;
         fs.repeat_log_window = std::time::Duration::from_secs(config.logging.repeat_log_window_secs);
         fs.trigger_strategy = trigger_strategy;
+        fs.playback_threshold = std::time::Duration::from_secs(config.cache.playback_threshold_secs);
 
         let cache_manager = Arc::new(cache::CacheManager::new(
             mount_cache_dir.clone(),

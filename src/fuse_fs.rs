@@ -28,6 +28,13 @@ pub enum TriggerStrategy {
     RollingBuffer,
 }
 
+/// Per-file-handle state for deferred playback detection.
+struct OpenFileState {
+    path: PathBuf,
+    opened_at: Instant,
+    event_sent: bool,
+}
+
 pub struct PlexHotCacheFs {
     /// O_PATH fd opened to target_directory *before* the FUSE overmount.
     pub backing_fd: RawFd,
@@ -37,7 +44,15 @@ pub struct PlexHotCacheFs {
     pub access_tx: Option<tokio::sync::mpsc::UnboundedSender<AccessEvent>>,
     pub repeat_log_window: Duration,
     pub trigger_strategy: TriggerStrategy,
+    /// How long a file must be actively read before the predictor is notified.
+    /// Zero means fire immediately on open() — preserves legacy behavior and is
+    /// the right default for tests. Set to ~10s in production to filter out Plex
+    /// Media Scanner's sub-second header probes from real user playback.
+    /// Alternative to time: count bytes read per handle; useful if disk speed
+    /// variability causes the time threshold to behave unexpectedly.
+    pub playback_threshold: Duration,
     recent_logs: Mutex<HashMap<PathBuf, Instant>>,
+    open_files: Mutex<HashMap<u64, OpenFileState>>,
 }
 
 impl PlexHotCacheFs {
@@ -66,7 +81,9 @@ impl PlexHotCacheFs {
             access_tx: None,
             repeat_log_window: Duration::from_secs(60),
             trigger_strategy: TriggerStrategy::CacheMissOnly,
+            playback_threshold: Duration::ZERO,
             recent_logs: Mutex::new(HashMap::new()),
+            open_files: Mutex::new(HashMap::new()),
         })
     }
 
@@ -286,9 +303,10 @@ impl Filesystem for PlexHotCacheFs {
         };
 
         let suppress = self.should_suppress_log(&path);
+        let deferred = !self.playback_threshold.is_zero();
 
-        // RollingBuffer: notify predictor on every access before the cache check.
-        if self.trigger_strategy == TriggerStrategy::RollingBuffer {
+        // RollingBuffer immediate mode: fire event before the cache check.
+        if self.trigger_strategy == TriggerStrategy::RollingBuffer && !deferred {
             if let Some(ref tx) = self.access_tx {
                 if suppress {
                     tracing::debug!("plex access: {:?}", path);
@@ -310,6 +328,15 @@ impl Filesystem for PlexHotCacheFs {
                             tracing::debug!("cache HIT: {:?} (serving from SSD)", path);
                         } else {
                             tracing::info!("cache HIT: {:?} (serving from SSD)", path);
+                        }
+                        // RollingBuffer deferred: track cache-hit handles too so the
+                        // predictor is notified once sustained playback is confirmed.
+                        if deferred && self.trigger_strategy == TriggerStrategy::RollingBuffer {
+                            self.open_files.lock().unwrap().insert(fd as u64, OpenFileState {
+                                path: path.clone(),
+                                opened_at: Instant::now(),
+                                event_sent: false,
+                            });
                         }
                         reply.opened(FileHandle(fd as u64), FopenFlags::empty());
                         return;
@@ -334,8 +361,14 @@ impl Filesystem for PlexHotCacheFs {
             tracing::info!("cache MISS: {:?} (serving from backing store)", path);
         }
 
-        // CacheMissOnly: notify predictor only on miss — hits mean lookahead is working.
-        if self.trigger_strategy == TriggerStrategy::CacheMissOnly {
+        if deferred {
+            self.open_files.lock().unwrap().insert(fd as u64, OpenFileState {
+                path: path.clone(),
+                opened_at: Instant::now(),
+                event_sent: false,
+            });
+        } else if self.trigger_strategy == TriggerStrategy::CacheMissOnly {
+            // Immediate mode: notify predictor on miss — hits mean lookahead is working.
             if let Some(ref tx) = self.access_tx {
                 let _ = tx.send(AccessEvent { relative_path: path.clone() });
             }
@@ -366,10 +399,27 @@ impl Filesystem for PlexHotCacheFs {
         };
         if n < 0 {
             reply.error(Errno::from_i32(last_errno()));
-        } else {
-            buf.truncate(n as usize);
-            reply.data(&buf);
+            return;
         }
+        buf.truncate(n as usize);
+
+        // Deferred playback detection: fire once the handle has been open for `playback_threshold`.
+        if !self.playback_threshold.is_zero() {
+            if let Some(ref tx) = self.access_tx {
+                let mut map = self.open_files.lock().unwrap();
+                if let Some(state) = map.get_mut(&(fh.0)) {
+                    if !state.event_sent && state.opened_at.elapsed() >= self.playback_threshold {
+                        state.event_sent = true;
+                        let path = state.path.clone();
+                        drop(map);
+                        tracing::info!("playback detected: {:?}", path);
+                        let _ = tx.send(AccessEvent { relative_path: path });
+                    }
+                }
+            }
+        }
+
+        reply.data(&buf);
     }
 
     fn release(
@@ -382,6 +432,7 @@ impl Filesystem for PlexHotCacheFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        self.open_files.lock().unwrap().remove(&(fh.0));
         unsafe { libc::close(fh.0 as RawFd) };
         reply.ok();
     }
