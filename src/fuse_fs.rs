@@ -246,11 +246,41 @@ impl Drop for PlexHotCacheFs {
     }
 }
 
-/// Returns the binary name of a process by reading /proc/<pid>/exe.
-/// Returns None if the process has exited or the link is unreadable.
+/// Returns None if the process has exited or the exe link is unreadable.
 fn process_name(pid: u32) -> Option<String> {
     let exe = std::fs::read_link(format!("/proc/{}/exe", pid)).ok()?;
     exe.file_name()?.to_str().map(|s| s.to_string())
+}
+
+fn parent_pid(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+    for line in status.lines() {
+        if let Some(ppid_str) = line.strip_prefix("PPid:\t") {
+            return ppid_str.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Catches child processes spawned by a blocklisted process — e.g. Plex Transcoder
+/// spawned by Plex Media Scanner for intro/credit analysis.
+fn is_blocked_process(pid: u32, blocklist: &[String]) -> bool {
+    let mut current = pid;
+    for _ in 0..16 {
+        if current <= 1 {
+            return false;
+        }
+        if let Some(name) = process_name(current) {
+            if blocklist.iter().any(|b| name == *b) {
+                return true;
+            }
+        }
+        match parent_pid(current) {
+            Some(ppid) if ppid != current => current = ppid,
+            _ => return false,
+        }
+    }
+    false
 }
 
 impl Filesystem for PlexHotCacheFs {
@@ -316,11 +346,13 @@ impl Filesystem for PlexHotCacheFs {
         let suppress = self.should_suppress_log(&path);
         let deferred = !self.playback_threshold.is_zero();
 
-        let blocked = !self.process_blocklist.is_empty() && process_name(req.pid())
-            .map(|name| self.process_blocklist.iter().any(|b| name == *b))
-            .unwrap_or(false);
+        let blocked = !self.process_blocklist.is_empty()
+            && is_blocked_process(req.pid(), &self.process_blocklist);
         if blocked {
-            tracing::debug!("process_blocklist: skipping prediction for pid {} on {:?}", req.pid(), path);
+            tracing::debug!(
+                "process_blocklist: blocked pid {} ({:?}) on {:?}",
+                req.pid(), process_name(req.pid()).unwrap_or_default(), path
+            );
         }
 
         // RollingBuffer immediate mode: fire event before the cache check.
@@ -373,7 +405,9 @@ impl Filesystem for PlexHotCacheFs {
             return;
         }
 
-        if suppress {
+        if blocked {
+            tracing::info!("ignored process access: {:?} (blocklisted, not caching)", path);
+        } else if suppress {
             tracing::debug!("cache MISS: {:?} (serving from backing store)", path);
         } else {
             tracing::info!("cache MISS: {:?} (serving from backing store)", path);

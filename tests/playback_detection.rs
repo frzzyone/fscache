@@ -11,16 +11,13 @@ async fn short_read_does_not_trigger_prediction() {
     let threshold = Duration::from_secs(2);
     let h = FuseHarness::new_full_pipeline_with_threshold(4, threshold).unwrap();
 
-    // Write episodes so there is something for the predictor to queue.
     for i in 1..=4u32 {
         write_backing_file(&h, &format!("Show/Show.S01E0{}.mkv", i), b"data");
     }
     std::thread::sleep(Duration::from_millis(100));
 
-    // Open and immediately close E01 — simulates a scanner probe.
     let _ = std::fs::read(h.mount_path().join("Show/Show.S01E01.mkv")).unwrap();
 
-    // Wait less than the threshold, then confirm nothing was cached.
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     let cache_path = h.cache_path();
@@ -79,7 +76,6 @@ async fn zero_threshold_fires_immediately() {
     }
     std::thread::sleep(Duration::from_millis(100));
 
-    // Single quick read of E01.
     let _ = std::fs::read(h.mount_path().join("Show/Show.S01E01.mkv")).unwrap();
 
     tokio::time::sleep(Duration::from_millis(800)).await;
@@ -127,6 +123,40 @@ async fn blocked_process_does_not_trigger_prediction() {
     }
 }
 
+/// A child of a blocklisted process must also be blocked (ancestor walk).
+/// Simulates Plex Media Scanner spawning Plex Transcoder for analysis.
+#[tokio::test]
+async fn child_of_blocked_process_is_also_blocked() {
+    let threshold = Duration::from_secs(2);
+    let h = FuseHarness::new_full_pipeline_with_blocklist(
+        4, threshold, vec!["bash".to_string()]
+    ).unwrap();
+
+    for i in 1..=5u32 {
+        write_backing_file(&h, &format!("Show/Show.S01E0{}.mkv", i), b"episode data");
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    let ep_path = h.mount_path().join("Show/Show.S01E01.mkv");
+    let mut child = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(format!("cat {}", ep_path.display()))
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let _ = child.wait();
+
+    tokio::time::sleep(threshold + Duration::from_secs(3)).await;
+
+    let cache_path = h.cache_path();
+    for i in 2..=5u32 {
+        assert!(
+            !cache_path.join(format!("Show/Show.S01E0{}.mkv", i)).exists(),
+            "E0{} must not be cached when opener's parent (bash) is blocklisted", i
+        );
+    }
+}
+
 /// With CacheMissOnly strategy and non-zero threshold, reading a cached file past
 /// the threshold must NOT fire a prediction event (the handle is not tracked).
 #[tokio::test]
@@ -144,8 +174,7 @@ async fn cache_hit_not_tracked_under_cache_miss_only() {
     let mount = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
 
-    // Pre-populate E01 in both backing and cache.
-    let content = vec![b'x'; 4 * 1024 * 1024]; // 4 MB
+    let content = vec![b'x'; 4 * 1024 * 1024]; // 4 MB — large enough to stay open past threshold
     std::fs::write(backing.path().join("Show.S01E01.mkv"), &content).unwrap();
     std::fs::write(cache_dir.path().join("Show.S01E01.mkv"), &content).unwrap();
 
@@ -184,7 +213,6 @@ async fn cache_hit_not_tracked_under_cache_miss_only() {
     let _session = fuser::spawn_mount2(fs, mount.path(), &config).unwrap();
     std::thread::sleep(Duration::from_millis(100));
 
-    // Read the cached E01 repeatedly for well past the threshold.
     let ep_path = mount.path().join("Show.S01E01.mkv");
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(3) {
