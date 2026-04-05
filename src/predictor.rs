@@ -30,6 +30,9 @@ pub struct AccessEvent {
 pub struct CopyRequest {
     pub rel_path: PathBuf,
     pub cache_dest: PathBuf,
+    /// Sender to notify the predictor when this copy completes or fails.
+    /// Allows in_flight to be cleaned up and fixes the existing unbounded growth bug.
+    pub done_tx: mpsc::UnboundedSender<PathBuf>,
 }
 
 pub struct Predictor {
@@ -79,6 +82,10 @@ impl Predictor {
         // Consume the immediate first tick so it doesn't fire instantly on startup.
         tick.tick().await;
 
+        // Copy-completion feedback: copier sends the rel_path back when done (success or failure).
+        // This is the fix for the existing bug where in_flight grew unboundedly.
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel::<PathBuf>();
+
         loop {
             let mut to_process: Vec<AccessEvent> = Vec::new();
 
@@ -87,7 +94,9 @@ impl Predictor {
                     match result {
                         Some(event) => {
                             tracing::debug!("predictor: received access event for {:?}", event.relative_path);
-                            if scheduler.is_caching_allowed() {
+                            let allowed = scheduler.is_caching_allowed();
+                            tracing::debug!(event = "caching_window", allowed, "caching window check");
+                            if allowed {
                                 if !deferred.is_empty() {
                                     tracing::info!(
                                         "predictor: caching window open, flushing {} deferred event(s)",
@@ -95,29 +104,35 @@ impl Predictor {
                                     );
                                     to_process.extend(deferred.drain().map(|(_, ev)| ev));
                                     clear_deferred(&cache_dir);
+                                    tracing::debug!(event = "deferred_changed", count = 0u64, "deferred cleared");
                                 }
                                 to_process.push(event);
                             } else {
                                 buffer_event(&mut deferred, event);
                                 save_deferred(&cache_dir, &deferred);
-                                tracing::debug!(
-                                    "predictor: outside caching window, {} show(s) buffered",
-                                    deferred.len()
-                                );
+                                let count = deferred.len() as u64;
+                                tracing::debug!(event = "deferred_changed", count, "predictor: outside caching window, {} show(s) buffered", count);
                             }
                         }
                         None => break,
                     }
                 }
                 _ = tick.tick() => {
-                    if scheduler.is_caching_allowed() && !deferred.is_empty() {
+                    let allowed = scheduler.is_caching_allowed();
+                    tracing::debug!(event = "caching_window", allowed, "caching window tick");
+                    if allowed && !deferred.is_empty() {
                         tracing::info!(
                             "predictor: caching window opened, flushing {} deferred event(s)",
                             deferred.len()
                         );
                         to_process.extend(deferred.drain().map(|(_, ev)| ev));
                         clear_deferred(&cache_dir);
+                        tracing::debug!(event = "deferred_changed", count = 0u64, "deferred cleared");
                     }
+                }
+                Some(completed) = done_rx.recv() => {
+                    in_flight.remove(&completed);
+                    tracing::debug!("predictor: in_flight cleanup for {}", completed.display());
                 }
             }
 
@@ -143,11 +158,14 @@ impl Predictor {
                     if budget_active {
                         let file_size = stat_backing_file(backing_fd, &rel).unwrap_or(0);
                         if !first_candidate && running_total + file_size > max_cache_pull_bytes {
+                            let used_gb = running_total as f64 / 1_073_741_824.0;
+                            let max_gb  = max_cache_pull_bytes as f64 / 1_073_741_824.0;
                             tracing::info!(
-                                "predictor: budget exhausted ({:.1} MB used of {:.1} MB), stopping before {}",
-                                running_total as f64 / 1_048_576.0,
-                                max_cache_pull_bytes as f64 / 1_048_576.0,
-                                rel.display(),
+                                event = "budget_updated",
+                                used_bytes = running_total,
+                                max_bytes = max_cache_pull_bytes,
+                                "predictor: budget exhausted ({:.1} GB used of {:.1} GB), stopping before {}",
+                                used_gb, max_gb, rel.display(),
                             );
                             break;
                         }
@@ -156,9 +174,13 @@ impl Predictor {
                     first_candidate = false;
 
                     let cache_dest = cache.cache_path(&rel);
-                    tracing::info!("predictor: queuing {} for caching", rel.display());
+                    tracing::info!(event = "copy_queued", path = %rel.display(), "predictor: queuing {} for caching", rel.display());
                     in_flight.insert(rel.clone());
-                    let _ = copy_tx.send(CopyRequest { rel_path: rel, cache_dest }).await;
+                    let _ = copy_tx.send(CopyRequest {
+                        rel_path: rel,
+                        cache_dest,
+                        done_tx: done_tx.clone(),
+                    }).await;
                 }
             }
         }
@@ -174,6 +196,7 @@ pub async fn run_copier_task(
     while let Some(req) = rx.recv().await {
         if cache.is_cached(&req.rel_path) {
             tracing::debug!("copier: {} already cached, skipping", req.rel_path.display());
+            let _ = req.done_tx.send(req.rel_path);
             continue;
         }
 
@@ -182,6 +205,7 @@ pub async fn run_copier_task(
                 "copier: insufficient free space, skipping {}",
                 req.rel_path.display()
             );
+            let _ = req.done_tx.send(req.rel_path);
             continue;
         }
 
@@ -189,17 +213,25 @@ pub async fn run_copier_task(
 
         let rel = req.rel_path.clone();
         let dest = req.cache_dest.clone();
-        tracing::info!("copier: caching {}", rel.display());
+        let done_tx = req.done_tx.clone();
+        tracing::info!(event = "copy_started", path = %rel.display(), "copier: caching {}", rel.display());
 
         let result =
             tokio::task::spawn_blocking(move || crate::copier::copy_to_cache(backing_fd, &rel, &dest))
                 .await;
 
         match result {
-            Ok(Ok(())) => tracing::info!("copier: cached {}", req.rel_path.display()),
-            Ok(Err(e)) => tracing::warn!("copier: copy failed {}: {e}", req.rel_path.display()),
-            Err(e) => tracing::warn!("copier: task panicked {}: {e}", req.rel_path.display()),
+            Ok(Ok(())) => {
+                tracing::info!(event = "copy_complete", path = %req.rel_path.display(), "copier: cached {}", req.rel_path.display());
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(event = "copy_failed", path = %req.rel_path.display(), "copier: copy failed {}: {e}", req.rel_path.display());
+            }
+            Err(e) => {
+                tracing::warn!(event = "copy_failed", path = %req.rel_path.display(), "copier: task panicked {}: {e}", req.rel_path.display());
+            }
         }
+        let _ = done_tx.send(req.rel_path);
     }
 }
 

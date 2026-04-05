@@ -6,6 +6,7 @@ mod inode;
 mod plex_db;
 mod predictor;
 mod scheduler;
+mod tui;
 mod utils;
 
 use clap::Parser;
@@ -26,6 +27,10 @@ struct Args {
     /// Path to config file (default: look next to binary or in current directory)
     #[arg(short, long)]
     config: Option<PathBuf>,
+
+    /// Launch the interactive TUI monitoring dashboard
+    #[arg(long)]
+    tui: bool,
 }
 
 #[tokio::main]
@@ -46,20 +51,41 @@ async fn main() -> anyhow::Result<()> {
     let file_appender = tracing_appender::rolling::daily(&config.logging.log_directory, "plex-hot-cache.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_target(false)
-                .with_filter(console_filter),
-        )
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_target(true)
-                .with_writer(non_blocking)
-                .with_filter(file_filter),
-        )
-        .init();
+    let dashboard = if args.tui {
+        let state = Arc::new(tui::state::DashboardState::new());
+        let metrics = tui::metrics_layer::MetricsLayer::new(Arc::clone(&state));
+        let logging = tui::logging::LoggingLayer::new(Arc::clone(&state));
+        // MetricsLayer is unfiltered — it must see debug-level events like caching_window.
+        let logging_filter = tracing_subscriber::EnvFilter::new(&config.logging.console_level);
+        tracing_subscriber::registry()
+            .with(metrics)
+            .with(logging.with_filter(logging_filter))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_writer(non_blocking)
+                    .with_filter(file_filter),
+            )
+            .init();
+        Some(state)
+    } else {
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_filter(console_filter),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_writer(non_blocking)
+                    .with_filter(file_filter),
+            )
+            .init();
+        None
+    };
 
     tracing::info!("plex-hot-cache {} starting", BUILD_VERSION);
     tracing::info!("Config: {}", config_path.display());
@@ -118,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
         target: PathBuf,
     }
     let mut mounts: Vec<MountHandle> = Vec::new();
+    let mut cache_managers: Vec<Arc<cache::CacheManager>> = Vec::new();
 
     for target in &targets {
         let mount_name = utils::mount_cache_name(target);
@@ -133,7 +160,21 @@ async fn main() -> anyhow::Result<()> {
         fs.repeat_log_window = std::time::Duration::from_secs(config.logging.repeat_log_window_secs);
         fs.trigger_strategy = trigger_strategy;
         fs.playback_threshold = std::time::Duration::from_secs(config.cache.playback_threshold_secs);
-        fs.process_blocklist = config.cache.process_blocklist.clone();
+        fs.process_blocklist = config.cache.process_blocklist.iter()
+            .filter(|name| {
+                if name.as_str() == "Plex Transcoder" {
+                    tracing::warn!(
+                        "[{}] Ignoring \"Plex Transcoder\" in process_blocklist — \
+                         detection vs playback transcoding is handled internally",
+                        mount_name
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
 
         let cache_manager = Arc::new(cache::CacheManager::new(
             mount_cache_dir.clone(),
@@ -193,9 +234,40 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("FUSE mount failed for {}: {e}\nHint: run as root or set 'user_allow_other' in /etc/fuse.conf", target.display()))?;
 
         mounts.push(MountHandle { _session: session, target: target.clone() });
+        cache_managers.push(cache_manager);
     }
 
     tracing::info!("{} mount(s) active. Waiting for shutdown signal...", mounts.len());
+
+    if let Some(ref state) = dashboard {
+        let mut mount_list = state.mounts.lock().unwrap();
+        for m in &mounts {
+            mount_list.push(tui::state::MountInfo { target: m.target.clone(), active: true });
+        }
+        drop(mount_list);
+        *state.window_start.lock().unwrap()      = config.schedule.cache_window_start.clone();
+        *state.window_end.lock().unwrap()        = config.schedule.cache_window_end.clone();
+        *state.trigger_strategy.lock().unwrap()  = config.cache.trigger_strategy.clone();
+        if max_cache_pull_bytes > 0 {
+            use std::sync::atomic::Ordering::Relaxed;
+            state.budget_max_bytes.store(max_cache_pull_bytes, Relaxed);
+        }
+    }
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let tui_handle = if let Some(state) = dashboard {
+        let tx  = shutdown_tx.clone();
+        let rx  = shutdown_rx.clone();
+        let cms = cache_managers.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = tui::app::run(state, cms, rx, tx).await {
+                eprintln!("TUI error: {e}");
+            }
+        }))
+    } else {
+        None
+    };
 
     let mut sigterm = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),
@@ -203,7 +275,19 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => tracing::info!("Received SIGINT"),
         _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
+        _ = async {
+            if let Some(handle) = tui_handle.as_ref() {
+                let mut rx = shutdown_rx.clone();
+                let _ = rx.wait_for(|&v| v).await;
+                let _ = handle;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => tracing::info!("TUI quit"),
     }
+
+    // Signal TUI to stop if it's still running (SIGINT path).
+    let _ = shutdown_tx.send(true);
 
     // Lazy unmount all: detach each mount point from the namespace immediately so
     // no new opens arrive, but Plex's already-open file descriptors remain valid.

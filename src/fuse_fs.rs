@@ -28,11 +28,13 @@ pub enum TriggerStrategy {
     RollingBuffer,
 }
 
-/// Per-file-handle state for deferred playback detection.
+/// Per-file-handle state for deferred playback detection and bytes-read tracking.
 struct OpenFileState {
     path: PathBuf,
     opened_at: Instant,
     event_sent: bool,
+    /// Accumulated bytes read through this handle; emitted as a single tracing event on release.
+    bytes_read: u64,
 }
 
 pub struct PlexHotCacheFs {
@@ -265,6 +267,15 @@ fn parent_pid(pid: u32) -> Option<u32> {
 /// Catches child processes spawned by a blocklisted process — e.g. Plex Transcoder
 /// spawned by Plex Media Scanner for intro/credit analysis.
 fn is_blocked_process(pid: u32, blocklist: &[String]) -> bool {
+    // Plex-specific: always check if this is a detection transcoder regardless of
+    // the user blocklist. Detection runs (`-f null`) perform intro/credit analysis
+    // and should never trigger caching. Real playback transcodes use `-f dash`,
+    // `-f mpegts`, etc. This is handled here rather than in the config because
+    // "Plex Transcoder" serves dual purposes and cannot be blanket-blocklisted.
+    if is_plex_detection_transcoder(pid) {
+        return true;
+    }
+
     let mut current = pid;
     for _ in 0..16 {
         if current <= 1 {
@@ -281,6 +292,26 @@ fn is_blocked_process(pid: u32, blocklist: &[String]) -> bool {
         }
     }
     false
+}
+
+/// Plex Transcoder is used for both real playback AND intro/credit detection.
+/// Detection runs transcode to null (`-f null`) — they never produce a real stream.
+/// Returns true only for "Plex Transcoder" processes with `-f null` in their args.
+fn is_plex_detection_transcoder(pid: u32) -> bool {
+    let name = match process_name(pid) {
+        Some(n) => n,
+        None => return false,
+    };
+    if name != "Plex Transcoder" {
+        return false;
+    }
+    // /proc/<pid>/cmdline is null-separated. Check for the `-f\0null\0` pattern.
+    let cmdline = match std::fs::read(format!("/proc/{}/cmdline", pid)) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let args: Vec<&[u8]> = cmdline.split(|&b| b == 0).collect();
+    args.windows(2).any(|pair| pair[0] == b"-f" && pair[1] == b"null")
 }
 
 impl Filesystem for PlexHotCacheFs {
@@ -367,6 +398,8 @@ impl Filesystem for PlexHotCacheFs {
             }
         }
 
+        tracing::debug!(event = "fuse_open", path = %path.display(), "fuse open");
+
         if !self.passthrough_mode {
             if let Some(ref cache) = self.cache {
                 if cache.is_cached(&path) {
@@ -375,9 +408,9 @@ impl Filesystem for PlexHotCacheFs {
                     let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY) };
                     if fd >= 0 {
                         if suppress {
-                            tracing::debug!("cache HIT: {:?} (serving from SSD)", path);
+                            tracing::debug!(event = "cache_hit", path = %path.display(), "cache HIT: {:?} (serving from SSD)", path);
                         } else {
-                            tracing::info!("cache HIT: {:?} (serving from SSD)", path);
+                            tracing::info!(event = "cache_hit", path = %path.display(), "cache HIT: {:?} (serving from SSD)", path);
                         }
                         // RollingBuffer deferred: track cache-hit handles too so the
                         // predictor is notified once sustained playback is confirmed.
@@ -386,6 +419,7 @@ impl Filesystem for PlexHotCacheFs {
                                 path: path.clone(),
                                 opened_at: Instant::now(),
                                 event_sent: false,
+                                bytes_read: 0,
                             });
                         }
                         reply.opened(FileHandle(fd as u64), FopenFlags::empty());
@@ -408,9 +442,9 @@ impl Filesystem for PlexHotCacheFs {
         if blocked {
             tracing::info!("ignored process access: {:?} (blocklisted, not caching)", path);
         } else if suppress {
-            tracing::debug!("cache MISS: {:?} (serving from backing store)", path);
+            tracing::debug!(event = "cache_miss", path = %path.display(), "cache MISS: {:?} (serving from backing store)", path);
         } else {
-            tracing::info!("cache MISS: {:?} (serving from backing store)", path);
+            tracing::info!(event = "cache_miss", path = %path.display(), "cache MISS: {:?} (serving from backing store)", path);
         }
 
         if deferred && !blocked {
@@ -418,6 +452,7 @@ impl Filesystem for PlexHotCacheFs {
                 path: path.clone(),
                 opened_at: Instant::now(),
                 event_sent: false,
+                bytes_read: 0,
             });
         } else if !blocked && self.trigger_strategy == TriggerStrategy::CacheMissOnly {
             // Immediate mode: notify predictor on miss — hits mean lookahead is working.
@@ -460,11 +495,12 @@ impl Filesystem for PlexHotCacheFs {
             if let Some(ref tx) = self.access_tx {
                 let mut map = self.open_files.lock().unwrap();
                 if let Some(state) = map.get_mut(&(fh.0)) {
+                    state.bytes_read += n as u64;
                     if !state.event_sent && state.opened_at.elapsed() >= self.playback_threshold {
                         state.event_sent = true;
                         let path = state.path.clone();
                         drop(map);
-                        tracing::info!("playback detected: {:?}", path);
+                        tracing::info!(event = "playback_detected", path = %path.display(), "playback detected: {:?}", path);
                         let _ = tx.send(AccessEvent { relative_path: path });
                     }
                 }
@@ -484,7 +520,11 @@ impl Filesystem for PlexHotCacheFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.open_files.lock().unwrap().remove(&(fh.0));
+        let bytes_read = self.open_files.lock().unwrap()
+            .remove(&(fh.0))
+            .map(|s| s.bytes_read)
+            .unwrap_or(0);
+        tracing::debug!(event = "handle_closed", bytes_read, "handle closed");
         unsafe { libc::close(fh.0 as RawFd) };
         reply.ok();
     }

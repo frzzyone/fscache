@@ -7,4 +7,5 @@ pub mod inode;
 pub mod plex_db;
 pub mod predictor;
 pub mod scheduler;
+pub mod tui;
 pub mod utils;

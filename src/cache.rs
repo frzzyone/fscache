@@ -1,6 +1,19 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+/// Snapshot of cache state returned by [`CacheManager::stats`].
+/// Polled by the TUI every few seconds — never called from the FUSE hot path.
+pub struct CacheStats {
+    pub max_size_bytes:   u64,
+    pub min_free_bytes:   u64,
+    pub expiry:           Duration,
+    pub free_space_bytes: Option<u64>,
+    pub used_bytes:       u64,
+    pub file_count:       usize,
+    /// (relative_path, size_bytes, atime)
+    pub files:            Vec<(PathBuf, u64, SystemTime)>,
+}
+
 /// No persistent database — uses filesystem timestamps exclusively.
 pub struct CacheManager {
     cache_dir: PathBuf,
@@ -93,7 +106,7 @@ impl CacheManager {
                     if let Err(e) = std::fs::remove_file(entry) {
                         tracing::warn!("evict (expiry): failed to delete {}: {e}", entry.display());
                     } else {
-                        tracing::info!("evict (expired): {}", entry.display());
+                        tracing::info!(event = "eviction", path = %entry.display(), reason = "expired", "evict (expired): {}", entry.display());
                         expiry_count += 1;
                         reclaimed_bytes += file_size;
                     }
@@ -136,7 +149,7 @@ impl CacheManager {
             if let Err(e) = std::fs::remove_file(&path) {
                 tracing::warn!("evict (size): failed to delete {}: {e}", path.display());
             } else {
-                tracing::info!("evict (size limit): {}", path.display());
+                tracing::info!(event = "eviction", path = %path.display(), reason = "size_limit", "evict (size limit): {}", path.display());
                 size_count += 1;
                 reclaimed_bytes += size;
                 global_total = global_total.saturating_sub(size);
@@ -166,6 +179,38 @@ impl CacheManager {
             .filter_map(|p| std::fs::metadata(p).ok())
             .map(|m| m.len())
             .sum()
+    }
+
+    /// Returns a full snapshot of cache state for TUI display.
+    /// Walks the cache directory — call at low frequency (every few seconds), never from FUSE.
+    pub fn stats(&self) -> CacheStats {
+        let files_raw = collect_cache_files(&self.cache_dir);
+        let mut used_bytes = 0u64;
+        let mut files = Vec::with_capacity(files_raw.len());
+
+        for abs_path in &files_raw {
+            if let Ok(meta) = std::fs::metadata(abs_path) {
+                let size = meta.len();
+                used_bytes += size;
+                let atime = meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH);
+                // Strip the cache_dir prefix to get the relative path for display.
+                let rel = abs_path
+                    .strip_prefix(&self.cache_dir)
+                    .unwrap_or(abs_path)
+                    .to_path_buf();
+                files.push((rel, size, atime));
+            }
+        }
+
+        CacheStats {
+            max_size_bytes:   self.max_size_bytes,
+            min_free_bytes:   self.min_free_bytes,
+            expiry:           self.expiry,
+            free_space_bytes: free_space_bytes(&self.cache_dir),
+            used_bytes,
+            file_count:       files.len(),
+            files,
+        }
     }
 
 }
