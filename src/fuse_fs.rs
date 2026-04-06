@@ -266,38 +266,40 @@ fn parent_pid(pid: u32) -> Option<u32> {
 
 /// Catches child processes spawned by a blocklisted process — e.g. Plex Transcoder
 /// spawned by Plex Media Scanner for intro/credit analysis.
-fn is_blocked_process(pid: u32, blocklist: &[String]) -> bool {
+/// Returns a human-readable reason string if blocked, or None if not blocked.
+fn is_blocked_process(pid: u32, blocklist: &[String]) -> Option<&'static str> {
     // Plex-specific: always check if this is a detection transcoder regardless of
-    // the user blocklist. Detection runs (no -progressurl, -f null/-f chromaprint)
-    // perform intro/credit analysis and must never trigger caching. Real playback
-    // transcodes always include -progressurl. This lives here rather than in config
-    // because "Plex Transcoder" serves dual purposes and cannot be blanket-blocklisted.
+    // the user blocklist. Detection runs use non-streaming output formats (-f flac,
+    // -f null, -f image2, etc.) or write to /Transcode/Detection/ — never -f dash/
+    // ssegment/mpegts. This lives here rather than in config because "Plex Transcoder"
+    // serves dual purposes and cannot be blanket-blocklisted.
     if is_plex_detection_transcoder(pid) {
-        return true;
+        return Some("detection transcoder");
     }
 
     let mut current = pid;
     for _ in 0..16 {
         if current <= 1 {
-            return false;
+            return None;
         }
         if let Some(name) = process_name(current) {
             if blocklist.iter().any(|b| name == *b) {
-                return true;
+                return Some("blocklisted process");
             }
         }
         match parent_pid(current) {
             Some(ppid) if ppid != current => current = ppid,
-            _ => return false,
+            _ => return None,
         }
     }
-    false
+    None
 }
 
-/// Plex Transcoder serves dual purposes: real playback AND intro/credit detection.
-/// Detection runs lack `-progressurl` and output to `-f null` or `-f chromaprint`.
-/// Playback runs always include `-progressurl` for session tracking, even when
-/// a secondary `-f null` output exists (e.g. subtitle extraction).
+/// Plex Transcoder serves dual purposes: real playback AND intro/credit/thumbnail detection.
+/// Playback always uses a streaming output format (-f dash, ssegment, mpegts).
+/// Detection uses non-streaming formats (-f flac, null, chromaprint, image2) and/or
+/// writes to /Transcode/Detection/. A secondary -f null (e.g. subtitle extraction) on
+/// a playback transcode is overridden by the presence of a streaming format.
 fn is_plex_detection_transcoder(pid: u32) -> bool {
     let name = match process_name(pid) {
         Some(n) => n,
@@ -312,22 +314,34 @@ fn is_plex_detection_transcoder(pid: u32) -> bool {
     };
     let args: Vec<&[u8]> = cmdline.split(|&b| b == 0).collect();
 
-    if has_progress_url(&args) {
+    if has_streaming_output(&args) {
         return false;
     }
-    has_analysis_output(&args)
+    has_analysis_output(&args) || has_detection_output_path(&cmdline)
 }
 
-/// Plex-custom ffmpeg addition, only present during real playback.
-fn has_progress_url(args: &[&[u8]]) -> bool {
-    args.iter().any(|a| a.starts_with(b"-progressurl"))
+const STREAMING_FORMATS: &[&[u8]] = &[b"dash", b"ssegment", b"mpegts"];
+const ANALYSIS_FORMATS: &[&[u8]] = &[b"null", b"chromaprint", b"flac", b"image2"];
+
+/// Real playback always uses one of these streaming container formats.
+fn has_streaming_output(args: &[&[u8]]) -> bool {
+    args.windows(2).any(|pair| {
+        pair[0] == b"-f" && STREAMING_FORMATS.contains(&pair[1])
+    })
 }
 
-/// Detection transcoders discard output via `-f null` or `-f chromaprint`.
+/// Detection transcoders use non-streaming output formats.
 fn has_analysis_output(args: &[&[u8]]) -> bool {
     args.windows(2).any(|pair| {
-        pair[0] == b"-f" && (pair[1] == b"null" || pair[1] == b"chromaprint")
+        pair[0] == b"-f" && ANALYSIS_FORMATS.contains(&pair[1])
     })
+}
+
+/// Detection transcoders write to /Transcode/Detection/ — catches future analysis
+/// modes that may use formats not yet in ANALYSIS_FORMATS.
+fn has_detection_output_path(cmdline: &[u8]) -> bool {
+    cmdline.windows(b"/Transcode/Detection/".len())
+        .any(|w| w == b"/Transcode/Detection/")
 }
 
 impl Filesystem for PlexHotCacheFs {
@@ -393,17 +407,20 @@ impl Filesystem for PlexHotCacheFs {
         let suppress = self.should_suppress_log(&path);
         let deferred = !self.playback_threshold.is_zero();
 
-        let blocked = !self.process_blocklist.is_empty()
-            && is_blocked_process(req.pid(), &self.process_blocklist);
-        if blocked {
+        let block_reason = if !self.process_blocklist.is_empty() {
+            is_blocked_process(req.pid(), &self.process_blocklist)
+        } else {
+            None
+        };
+        if let Some(reason) = block_reason {
             tracing::debug!(
-                "process_blocklist: blocked pid {} ({:?}) on {:?}",
+                "process_blocklist: blocked pid {} ({:?}) as {reason} on {:?}",
                 req.pid(), process_name(req.pid()).unwrap_or_default(), path
             );
         }
 
         // RollingBuffer immediate mode: fire event before the cache check.
-        if self.trigger_strategy == TriggerStrategy::RollingBuffer && !deferred && !blocked {
+        if self.trigger_strategy == TriggerStrategy::RollingBuffer && !deferred && block_reason.is_none() {
             if let Some(ref tx) = self.access_tx {
                 if suppress {
                     tracing::debug!("plex access: {:?}", path);
@@ -430,7 +447,7 @@ impl Filesystem for PlexHotCacheFs {
                         }
                         // RollingBuffer deferred: track cache-hit handles too so the
                         // predictor is notified once sustained playback is confirmed.
-                        if deferred && !blocked && self.trigger_strategy == TriggerStrategy::RollingBuffer {
+                        if deferred && block_reason.is_none() && self.trigger_strategy == TriggerStrategy::RollingBuffer {
                             self.open_files.lock().unwrap().insert(fd as u64, OpenFileState {
                                 path: path.clone(),
                                 opened_at: Instant::now(),
@@ -455,22 +472,22 @@ impl Filesystem for PlexHotCacheFs {
             return;
         }
 
-        if blocked {
-            tracing::info!("ignored process access: {:?} (blocklisted, not caching)", path);
+        if let Some(reason) = block_reason {
+            tracing::info!("ignored process access: {:?} ({reason}, not caching)", path);
         } else if suppress {
             tracing::debug!(event = "cache_miss", path = %path.display(), "cache MISS: {:?} (serving from backing store)", path);
         } else {
             tracing::info!(event = "cache_miss", path = %path.display(), "cache MISS: {:?} (serving from backing store)", path);
         }
 
-        if deferred && !blocked {
+        if deferred && block_reason.is_none() {
             self.open_files.lock().unwrap().insert(fd as u64, OpenFileState {
                 path: path.clone(),
                 opened_at: Instant::now(),
                 event_sent: false,
                 bytes_read: 0,
             });
-        } else if !blocked && self.trigger_strategy == TriggerStrategy::CacheMissOnly {
+        } else if block_reason.is_none() && self.trigger_strategy == TriggerStrategy::CacheMissOnly {
             // Immediate mode: notify predictor on miss — hits mean lookahead is working.
             if let Some(ref tx) = self.access_tx {
                 let _ = tx.send(AccessEvent { relative_path: path.clone() });
@@ -701,35 +718,69 @@ fn mode_to_filetype(mode: libc::mode_t) -> FileType {
 mod tests {
     use super::*;
 
-    fn args(cmdline: &[u8]) -> Vec<&[u8]> {
+    fn split(cmdline: &[u8]) -> Vec<&[u8]> {
         cmdline.split(|&b| b == 0).collect()
     }
 
     #[test]
     fn detection_null_output() {
         let cmdline = b"Plex Transcoder\0-i\0input.mkv\0-vn\0-f\0null\0-";
-        assert!(has_analysis_output(&args(cmdline)));
-        assert!(!has_progress_url(&args(cmdline)));
+        assert!(has_analysis_output(&split(cmdline)));
+        assert!(!has_streaming_output(&split(cmdline)));
     }
 
     #[test]
     fn detection_chromaprint_output() {
         let cmdline = b"Plex Transcoder\0-i\0input.mkv\0-f\0chromaprint\0-";
-        assert!(has_analysis_output(&args(cmdline)));
-        assert!(!has_progress_url(&args(cmdline)));
+        assert!(has_analysis_output(&split(cmdline)));
+        assert!(!has_streaming_output(&split(cmdline)));
     }
 
-    // Bug case: was incorrectly classified as detection due to secondary -f null.
+    // Credits detection transcoder: has -progressurl but is NOT playback.
+    // Primary output is -f flac to /dev/shm/Transcode/Detection/, secondary -f null.
+    // Previously this slipped through the -progressurl gate — caught by format check now.
+    #[test]
+    fn detection_flac_with_progressurl() {
+        let cmdline = b"Plex Transcoder\0-i\0input.mkv\
+            \0-progressurl\0http://127.0.0.1:32400/.../progress\
+            \0-codec:0\0flac\0-f\0flac\
+            \0/dev/shm/Transcode/Detection/abc123\
+            \0-f\0null\0nullfile";
+        assert!(!has_streaming_output(&split(cmdline)));
+        assert!(has_analysis_output(&split(cmdline)));
+        assert!(has_detection_output_path(cmdline));
+    }
+
+    #[test]
+    fn detection_image2_thumbnails() {
+        let cmdline = b"Plex Transcoder\0-i\0input.mkv\
+            \0-skip_frame\0noref\0-vf\0fps=0.5,scale=w=320:h=320\
+            \0-f\0image2\0thumb-%05d.jpeg";
+        assert!(!has_streaming_output(&split(cmdline)));
+        assert!(has_analysis_output(&split(cmdline)));
+    }
+
+    // Path check catches analysis even when format is unrecognized.
+    #[test]
+    fn detection_output_path() {
+        let cmdline = b"Plex Transcoder\0-i\0input.mkv\
+            \0-f\0someunknownformat\
+            \0/dev/shm/Transcode/Detection/abc123";
+        assert!(!has_streaming_output(&split(cmdline)));
+        assert!(!has_analysis_output(&split(cmdline))); // format unknown
+        assert!(has_detection_output_path(cmdline));    // but path catches it
+    }
+
+    // Bug case: playback with secondary -f null for subtitle extraction.
+    // The -f dash streaming format takes precedence.
     #[test]
     fn playback_dash_with_secondary_null_not_detection() {
         let cmdline = b"Plex Transcoder\0-i\0input.mkv\
             \0-progressurl\0http://127.0.0.1:32400/.../progress\
             \0-f\0dash\0manifest.mpd\
             \0-map\x000:2\0-f\0null\0-codec\0ass\0nullfile";
-        assert!(has_progress_url(&args(cmdline)));
-        assert!(has_analysis_output(&args(cmdline))); // secondary -f null present
-        // -progressurl takes precedence — not detection
-        assert!(has_progress_url(&args(cmdline)));
+        assert!(has_streaming_output(&split(cmdline)));
+        assert!(has_analysis_output(&split(cmdline))); // secondary -f null present
     }
 
     #[test]
@@ -737,8 +788,8 @@ mod tests {
         let cmdline = b"Plex Transcoder\0-i\0input.mkv\
             \0-progressurl\0http://127.0.0.1:32400/.../progress\
             \0-f\0dash\0manifest.mpd";
-        assert!(has_progress_url(&args(cmdline)));
-        assert!(!has_analysis_output(&args(cmdline)));
+        assert!(has_streaming_output(&split(cmdline)));
+        assert!(!has_analysis_output(&split(cmdline)));
     }
 
     #[test]
@@ -746,8 +797,8 @@ mod tests {
         let cmdline = b"Plex Transcoder\0-i\0input.mkv\
             \0-progressurl\0http://127.0.0.1:32400/.../progress\
             \0-f\0ssegment\0-segment_format\0mp4\0media-%05d.ts";
-        assert!(has_progress_url(&args(cmdline)));
-        assert!(!has_analysis_output(&args(cmdline)));
+        assert!(has_streaming_output(&split(cmdline)));
+        assert!(!has_analysis_output(&split(cmdline)));
     }
 
     #[test]
@@ -755,15 +806,16 @@ mod tests {
         let cmdline = b"Plex Transcoder\0-i\0input.ts\
             \0-progressurl\0http://127.0.0.1:32400/.../progress\
             \0-f\0mpegts\0pipe:1";
-        assert!(has_progress_url(&args(cmdline)));
-        assert!(!has_analysis_output(&args(cmdline)));
+        assert!(has_streaming_output(&split(cmdline)));
+        assert!(!has_analysis_output(&split(cmdline)));
     }
 
-    // Unknown: no -f and no -progressurl → not detection (conservative default)
+    // Unknown purpose, no recognized signals → not detection (conservative default).
     #[test]
     fn unknown_transcoder_not_detection() {
         let cmdline = b"Plex Transcoder\0-i\0input.mkv\0-codec\0copy\0output.mkv";
-        assert!(!has_progress_url(&args(cmdline)));
-        assert!(!has_analysis_output(&args(cmdline)));
+        assert!(!has_streaming_output(&split(cmdline)));
+        assert!(!has_analysis_output(&split(cmdline)));
+        assert!(!has_detection_output_path(cmdline));
     }
 }
