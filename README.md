@@ -6,10 +6,9 @@ No Plex plugins, no API wrappers, no config changes on the Plex side. Drop it in
 
 One of the main principles I had when developing this was that it is a simple "drop-in" hot cache binary that anyone can use. I try my best to make it crash gracefully.
 
-I created this binary for a few reasons: 
-    1) I wanted to better handle my array spin up / downs to save power (it really adds up in SoCal)
-    2) To improve the viewing experience for myself
-    3) No other library really did what I wanted it to do (straightforward, simple setup, simple teardown,)
+# Future Plans
+
+I built this as a proof of concept using Plex as the driver, but I plan on making this much more generic so that anyone cache anything on their NAS or datastorage.
 
 ## Now enhanced with Ratatui via --tui
 <table>                       
