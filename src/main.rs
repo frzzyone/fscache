@@ -1,15 +1,11 @@
-mod action_engine;
 mod backing_store;
 mod cache;
 mod config;
-mod copier;
-mod db;
-mod fuse_fs;
-mod inode;
+mod engine;
+mod fuse;
 mod prediction_utils;
 mod preset;
 mod presets;
-mod scheduler;
 mod telemetry;
 mod tui;
 mod utils;
@@ -140,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
         target: PathBuf,
     }
     let mut mounts: Vec<MountHandle> = Vec::new();
-    let mut cache_managers: Vec<Arc<cache::CacheManager>> = Vec::new();
+    let mut cache_managers: Vec<Arc<cache::manager::CacheManager>> = Vec::new();
 
     for target in &targets {
         let mount_name = utils::mount_cache_name(target);
@@ -151,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("[{}] Cache:  {}", mount_name, mount_cache_dir.display());
 
         // Must open O_PATH fd BEFORE mounting FUSE over the target directory.
-        let mut fs = fuse_fs::FsCache::new(target)?;
+        let mut fs = fuse::fusefs::FsCache::new(target)?;
         fs.passthrough_mode = config.cache.passthrough_mode;
         fs.repeat_log_window = std::time::Duration::from_secs(config.logging.repeat_log_window_secs);
 
@@ -181,7 +177,7 @@ async fn main() -> anyhow::Result<()> {
         };
         fs.preset = Some(std::sync::Arc::clone(&preset));
 
-        let cache_manager = Arc::new(cache::CacheManager::new(
+        let cache_manager = Arc::new(cache::manager::CacheManager::new(
             mount_cache_dir.clone(),
             base_cache_dir.clone(),
             config.cache.max_size_gb,
@@ -192,15 +188,15 @@ async fn main() -> anyhow::Result<()> {
         fs.cache = Some(Arc::clone(&cache_manager));
 
         let (access_tx, access_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (copy_tx, copy_rx) = tokio::sync::mpsc::channel::<action_engine::CopyRequest>(64);
+        let (copy_tx, copy_rx) = tokio::sync::mpsc::channel::<engine::action::CopyRequest>(64);
         fs.access_tx = Some(access_tx);
 
         let backing_store = std::sync::Arc::clone(&fs.backing_store);
-        let scheduler = scheduler::Scheduler::new(
+        let scheduler = engine::scheduler::Scheduler::new(
             &config.schedule.cache_window_start,
             &config.schedule.cache_window_end,
         )?;
-        let engine = action_engine::ActionEngine::new(
+        let engine = engine::action::ActionEngine::new(
             access_rx,
             copy_tx,
             Arc::clone(&cache_manager),
@@ -213,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
             config.cache.min_file_size_mb,
         );
         tokio::spawn(engine.run());
-        tokio::spawn(action_engine::run_copier_task(
+        tokio::spawn(engine::action::run_copier_task(
             backing_store,
             copy_rx,
             Arc::clone(&cache_manager),

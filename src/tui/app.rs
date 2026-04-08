@@ -11,7 +11,7 @@ use ratatui::Terminal;
 use tokio::sync::watch;
 use tokio::time::interval;
 
-use crate::cache::CacheManager;
+use crate::cache::manager::CacheManager;
 use super::state::{CachedFileInfo, CacheSort, DashboardState, Page};
 use super::ui;
 

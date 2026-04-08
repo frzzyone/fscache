@@ -8,11 +8,11 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
 use crate::backing_store::BackingStore;
-use crate::cache::CacheManager;
-use crate::db::CacheDb;
+use crate::cache::manager::CacheManager;
+use crate::cache::db::CacheDb;
 use crate::prediction_utils::parse_season_episode;
 use crate::preset::{CacheAction, CachePreset, RuleContext};
-use crate::scheduler::Scheduler;
+use super::scheduler::Scheduler;
 use crate::telemetry;
 
 /// Which preset handler this event should invoke.
@@ -367,7 +367,7 @@ pub async fn run_copier_task(
 
         let bs = Arc::clone(&backing_store);
         let result =
-            tokio::task::spawn_blocking(move || crate::copier::copy_to_cache(&bs, &rel, &dest))
+            tokio::task::spawn_blocking(move || crate::engine::copier::copy_to_cache(&bs, &rel, &dest))
                 .await;
 
         match result {

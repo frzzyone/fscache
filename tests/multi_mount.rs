@@ -244,7 +244,7 @@ fn concurrent_reads_across_mounts() {
 
 #[test]
 fn global_eviction_respects_total_budget() {
-    use fscache::cache::CacheManager;
+    use fscache::cache::manager::CacheManager;
 
     // Two mounts sharing a 2 KB global budget.  Each file is ~600 bytes,
     // so after writing 2 files to each mount (4 files total, ~2.4 KB) the

@@ -2,12 +2,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use fuser::{MountOption, SessionACL};
-use fscache::action_engine::{run_copier_task, AccessEvent, ActionEngine, CopyRequest};
-use fscache::cache::CacheManager;
-use fscache::fuse_fs::FsCache;
+use fscache::engine::action::{run_copier_task, AccessEvent, ActionEngine, CopyRequest};
+use fscache::cache::manager::CacheManager;
+use fscache::fuse::fusefs::FsCache;
 use fscache::preset::CachePreset;
 use fscache::presets::plex_episode_prediction::PlexEpisodePrediction;
-use fscache::scheduler::Scheduler;
+use fscache::engine::scheduler::Scheduler;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 

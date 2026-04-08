@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use crate::db::CacheDb;
+use super::db::CacheDb;
 
 /// Snapshot of cache state returned by [`CacheManager::stats`].
 /// Polled by the TUI every few seconds — never called from the FUSE hot path.

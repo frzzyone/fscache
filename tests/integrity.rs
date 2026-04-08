@@ -82,7 +82,7 @@ fn unmount_restores_backing_access() {
     // Mount and drop
     {
         use fuser::{MountOption, SessionACL};
-        use fscache::fuse_fs::FsCache;
+        use fscache::fuse::fusefs::FsCache;
 
         let fs = FsCache::new(backing_dir.path()).unwrap();
         let mut config = fuser::Config::default();

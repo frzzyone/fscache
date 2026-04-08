@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use common::write_backing_file;
 
-use fscache::fuse_fs::FsCache;
+use fscache::fuse::fusefs::FsCache;
 use tempfile::TempDir;
 
 fn test_fuse_config() -> fuser::Config {

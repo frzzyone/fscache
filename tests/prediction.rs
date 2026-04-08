@@ -9,16 +9,16 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
-use fscache::action_engine::{
+use fscache::engine::action::{
     buffer_event, run_copier_task, show_root, AccessEvent, ActionEngine, CopyRequest,
 };
 use fscache::backing_store::BackingStore;
-use fscache::cache::CacheManager;
-use fscache::db::CacheDb;
+use fscache::cache::manager::CacheManager;
+use fscache::cache::db::CacheDb;
 use fscache::preset::CachePreset;
 use fscache::prediction_utils::{parse_season_dir, parse_season_episode};
 use fscache::presets::plex_episode_prediction::PlexEpisodePrediction;
-use fscache::scheduler::Scheduler;
+use fscache::engine::scheduler::Scheduler;
 
 // ---- Scheduler tests ----
 
@@ -304,7 +304,7 @@ fn copier_copies_file_correctly() {
     let backing_store = make_backing_store(backing.path());
 
     let dest = cache_dir.path().join("test.mkv");
-    fscache::copier::copy_to_cache(
+    fscache::engine::copier::copy_to_cache(
         &backing_store,
         std::path::Path::new("test.mkv"),
         &dest,

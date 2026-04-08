@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::backing_store::BackingStore;
-use crate::db::CacheDb;
+use crate::cache::db::CacheDb;
 
 /// Information about the process that opened a file, captured synchronously in open().
 pub struct ProcessInfo {

@@ -185,7 +185,7 @@ async fn getattr_returns_backing_store_mtime() {
         let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_DIRECTORY) };
         assert!(fd >= 0);
         let bs = fscache::backing_store::BackingStore::new(fd);
-        fscache::copier::copy_to_cache(&bs, std::path::Path::new("tv/Show/S01E01.mkv"), &cache_dest).unwrap();
+        fscache::engine::copier::copy_to_cache(&bs, std::path::Path::new("tv/Show/S01E01.mkv"), &cache_dest).unwrap();
     }
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -228,7 +228,7 @@ async fn cached_file_preserves_metadata() {
         let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_DIRECTORY) };
         assert!(fd >= 0, "failed to open backing dir");
         let bs = fscache::backing_store::BackingStore::new(fd);
-        fscache::copier::copy_to_cache(&bs, std::path::Path::new("tv/Show/S01E01.mkv"), &cache_dest)
+        fscache::engine::copier::copy_to_cache(&bs, std::path::Path::new("tv/Show/S01E01.mkv"), &cache_dest)
             .expect("copy_to_cache failed");
     }
 

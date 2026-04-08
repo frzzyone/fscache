@@ -92,8 +92,8 @@ fn cache_transition_after_copy() {
 
 #[test]
 fn passthrough_mode_bypasses_cache() {
-    use fscache::cache::CacheManager;
-    use fscache::fuse_fs::FsCache;
+    use fscache::cache::manager::CacheManager;
+    use fscache::fuse::fusefs::FsCache;
     use fuser::{MountOption, SessionACL};
     use tempfile::TempDir;
 
@@ -132,7 +132,7 @@ fn passthrough_mode_bypasses_cache() {
 /// Startup cleanup: .partial files in the cache are removed on CacheManager creation.
 #[test]
 fn startup_cleanup_removes_partials() {
-    use fscache::cache::CacheManager;
+    use fscache::cache::manager::CacheManager;
     use tempfile::TempDir;
 
     let cache_dir = TempDir::new().unwrap();
@@ -155,7 +155,7 @@ fn startup_cleanup_removes_partials() {
 
 #[test]
 fn size_eviction_removes_oldest_files() {
-    use fscache::cache::CacheManager;
+    use fscache::cache::manager::CacheManager;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -198,7 +198,7 @@ fn size_eviction_removes_oldest_files() {
 
 #[test]
 fn expiry_eviction_removes_expired_files() {
-    use fscache::cache::CacheManager;
+    use fscache::cache::manager::CacheManager;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -240,7 +240,7 @@ fn expiry_eviction_removes_expired_files() {
 // the source file has an old mtime. Eviction uses DB last_hit_at, not filesystem mtime.
 #[test]
 fn freshly_cached_file_with_old_mtime_survives_eviction() {
-    use fscache::cache::CacheManager;
+    use fscache::cache::manager::CacheManager;
     use std::path::Path;
     use tempfile::TempDir;
 

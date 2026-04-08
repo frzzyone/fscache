@@ -16,9 +16,9 @@ use fuser::{
     ReplyEntry, ReplyOpen, Request,
 };
 
-use crate::cache::CacheManager;
-use crate::inode::InodeTable;
-use crate::action_engine::AccessEvent;
+use crate::cache::manager::CacheManager;
+use super::inode::InodeTable;
+use crate::engine::action::AccessEvent;
 
 /// Short TTL so the kernel re-checks after a cache file appears.
 const TTL: Duration = Duration::from_secs(1);

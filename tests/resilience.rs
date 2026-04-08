@@ -96,7 +96,7 @@ fn copier_no_partial_left_on_source_missing() {
     let bs = BackingStore::new(fd);
 
     // Source file does not exist → copy must fail cleanly
-    let result = fscache::copier::copy_to_cache(
+    let result = fscache::engine::copier::copy_to_cache(
         &bs,
         std::path::Path::new("nonexistent.mkv"),
         &dest,
@@ -117,7 +117,7 @@ fn copier_no_partial_left_on_source_missing() {
 /// and is removed on the next CacheManager startup cleanup.
 #[test]
 fn orphaned_partial_is_cleaned_and_invisible() {
-    use fscache::cache::CacheManager;
+    use fscache::cache::manager::CacheManager;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -141,7 +141,7 @@ fn orphaned_partial_is_cleaned_and_invisible() {
     assert!(!partial.exists(), ".partial must be removed by startup_cleanup");
 
     // FUSE mount should serve the backing file (not the now-deleted partial)
-    let mut fs = fscache::fuse_fs::FsCache::new(backing.path()).unwrap();
+    let mut fs = fscache::fuse::fusefs::FsCache::new(backing.path()).unwrap();
     fs.cache = Some(std::sync::Arc::clone(&mgr));
     let mount = TempDir::new().unwrap();
     let mut config = fuser::Config::default();
@@ -167,7 +167,7 @@ fn orphaned_partial_is_cleaned_and_invisible() {
 /// across open/close cycles and are an OS concern, not a FUSE concern.
 #[test]
 fn fuse_falls_back_to_backing_on_cache_miss() {
-    use fscache::cache::CacheManager;
+    use fscache::cache::manager::CacheManager;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -186,7 +186,7 @@ fn fuse_falls_back_to_backing_on_cache_miss() {
     std::fs::write(cache_dir.path().join("cached.mkv"), b"ssdcached_A").unwrap(); // 11 bytes
 
     let mgr = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), cache_dir.path().to_path_buf(), 1.0, 72, 0.0));
-    let mut fs = fscache::fuse_fs::FsCache::new(backing.path()).unwrap();
+    let mut fs = fscache::fuse::fusefs::FsCache::new(backing.path()).unwrap();
     fs.cache = Some(std::sync::Arc::clone(&mgr));
 
     let mut config = fuser::Config::default();
