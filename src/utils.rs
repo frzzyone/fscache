@@ -255,6 +255,17 @@ mod tests {
     }
 }
 
+/// Format a `SystemTime` as a local-time `HH:MM:SS` string.
+pub fn fmt_time(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&secs, &mut tm) };
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
 pub fn find_file_near_binary(filename: &str) -> anyhow::Result<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {

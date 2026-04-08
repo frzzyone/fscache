@@ -4,17 +4,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-/// All state displayed by the TUI. Populated by MetricsLayer (tracing events)
-/// and a polling task (CacheManager::stats() every 3s).
+/// All state displayed by the TUI. Populated via IPC events from the daemon
+/// and a DB polling task for cache file stats.
 pub struct DashboardState {
-    // -- FUSE counters (updated by MetricsLayer from tracing events) --
+    // -- FUSE counters --
     pub fuse_opens:   AtomicU64,
     pub cache_hits:   AtomicU64,
     pub cache_misses: AtomicU64,
     pub bytes_read:   AtomicU64,
     pub open_handles: AtomicU64,
 
-    // -- Cache stats (updated by polling task every 3s) --
+    // -- Cache stats (DB polling) --
     pub cache_used_bytes:      AtomicU64,
     pub cache_max_bytes:       AtomicU64,
     pub cache_free_bytes:      AtomicU64,
@@ -22,36 +22,35 @@ pub struct DashboardState {
     pub cache_file_count:      AtomicU64,
     pub cached_files:          Mutex<Vec<CachedFileInfo>>,
 
-    // -- Action Engine (updated by MetricsLayer) --
+    // -- Action Engine --
     pub in_flight_count:   AtomicU64,
     pub deferred_count:    AtomicU64,
     pub budget_used_bytes: AtomicU64,
     pub budget_max_bytes:  AtomicU64,
     pub preset_name:       Mutex<String>,
 
-    // -- Copier (updated by MetricsLayer) --
+    // -- Copier --
     pub active_copies:    Mutex<HashMap<PathBuf, CopyProgress>>,
     pub completed_copies: AtomicU64,
     pub failed_copies:    AtomicU64,
 
-    // -- Evictions (updated by MetricsLayer) --
+    // -- Evictions --
     pub evictions_expired: AtomicU64,
     pub evictions_size:    AtomicU64,
 
-    // -- Scheduler (updated by MetricsLayer) --
+    // -- Scheduler --
     pub caching_allowed: AtomicBool,
     pub window_start:    Mutex<String>,
     pub window_end:      Mutex<String>,
 
-    // -- Mounts (set once at startup in main.rs) --
+    // -- Mounts (set once at startup) --
     pub mounts: Mutex<Vec<MountInfo>>,
 
-    // -- Log capture (ring buffer, max 200 entries) --
-    pub recent_logs: Mutex<VecDeque<LogEntry>>,
+    // -- Cache expiry (from Hello, used to compute evicts_at in the file list) --
+    pub expiry_secs: AtomicU64,
 
-    // -- Set to true by app::run() after terminal is restored so LoggingLayer
-    //    falls back to stderr instead of the ring buffer. --
-    pub tui_exited: AtomicBool,
+    // -- Log capture --
+    pub recent_logs: Mutex<VecDeque<LogEntry>>,
 }
 
 impl DashboardState {
@@ -87,9 +86,9 @@ impl DashboardState {
             window_start:    Mutex::new(String::new()),
             window_end:      Mutex::new(String::new()),
 
-            mounts:      Mutex::new(Vec::new()),
-            recent_logs: Mutex::new(VecDeque::new()),
-            tui_exited:  AtomicBool::new(false),
+            mounts:       Mutex::new(Vec::new()),
+            expiry_secs:  AtomicU64::new(0),
+            recent_logs:  Mutex::new(VecDeque::new()),
         }
     }
 
@@ -103,14 +102,12 @@ impl DashboardState {
 
 }
 
-/// One entry in the recent-logs ring buffer.
 pub struct LogEntry {
     pub timestamp: String,
     pub level:     String,
     pub message:   String,
 }
 
-/// A file currently in the cache — for the Cache page file list.
 pub struct CachedFileInfo {
     pub path:        PathBuf,
     pub size_bytes:  u64,
@@ -134,10 +131,11 @@ impl CopyProgress {
     }
 }
 
-/// One FUSE mount — target path and whether the FUSE session is active.
 pub struct MountInfo {
-    pub target:  PathBuf,
-    pub active:  bool,
+    pub target:    PathBuf,
+    /// The mount's cache subdirectory; also the `mount_id` in the database.
+    pub cache_dir: PathBuf,
+    pub active:    bool,
 }
 
 /// Sort order for the Cache page file list.

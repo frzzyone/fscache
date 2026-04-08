@@ -272,6 +272,53 @@ impl CacheDb {
         let _ = conn.execute("DELETE FROM deferred_events", []);
     }
 
+    /// Open the database in read-only mode for use by the watch client.
+    ///
+    /// Uses `PRAGMA query_only=1` to prevent accidental writes. WAL mode on the
+    /// daemon side allows concurrent read access without blocking writers.
+    pub fn open_readonly(path: &Path) -> anyhow::Result<Self> {
+        // Open in read-write mode first so rusqlite can apply the WAL checkpoint
+        // pragmas on first open; query_only prevents any actual mutations.
+        let conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA query_only=1;")?;
+        Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    /// Returns `(used_bytes, Vec<(rel_path, size_bytes, cached_at, last_hit_at)>)`
+    /// for a single mount. Used by the watch client for cache-page polling.
+    pub fn client_files_for_mount(
+        &self,
+        mount_id: &str,
+    ) -> (u64, Vec<(PathBuf, u64, SystemTime, SystemTime)>) {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT rel_path, size_bytes, cached_at, last_hit_at \
+             FROM cache_files WHERE mount_id = ?1",
+        ) {
+            Ok(s) => s,
+            Err(_) => return (0, vec![]),
+        };
+        let rows: Vec<(PathBuf, u64, SystemTime, SystemTime)> = stmt
+            .query_map(params![mount_id], |row| {
+                let path: String = row.get(0)?;
+                let size: i64    = row.get(1)?;
+                let ca: i64      = row.get(2)?;
+                let lha: i64     = row.get(3)?;
+                Ok((
+                    PathBuf::from(path),
+                    size.max(0) as u64,
+                    UNIX_EPOCH + Duration::from_secs(ca.max(0) as u64),
+                    UNIX_EPOCH + Duration::from_secs(lha.max(0) as u64),
+                ))
+            })
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
+        let used_bytes: u64 = rows.iter().map(|(_, s, _, _)| s).sum();
+        (used_bytes, rows)
+    }
+
     /// Return a map of `rel_path → (cached_at, last_hit_at)` for all files in a mount.
     /// Used by the TUI stats poll to display accurate insertion and last-access times.
     pub fn file_timestamps(&self, mount_id: &str) -> HashMap<PathBuf, (SystemTime, SystemTime)> {
