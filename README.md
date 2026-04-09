@@ -5,9 +5,10 @@ Transparent SSD caching for any read-heavy file workload — media servers, NAS-
 No plugins, no API wrappers, no config changes on the application side. Drop it in, point it at your media directory, and remove it just as easily. As long as it receives a proper signal, you can stop it while your server is running. Active streams will need to be restarted, but your server won't.
 
 I created this for a few reasons:
-1. Better handle array spin-up/downs to save power (it really adds up in SoCal)
-2. Improve the viewing experience for myself
-3. No other tool did what I wanted — straightforward, simple setup and teardown
+1. Works on top of any filesystem. This is the main motivation. I have MergerFS + Snapraid and some LVM. A lot of times, I just want to add a small file cache on top of my most hotly contested files without needing to change the entire setup.
+2. Better handle array spin-up/downs to save power (it really adds up in SoCal)
+3. Improve the viewing experience for myself
+4. No other tool did what I wanted — straightforward, simple setup and teardown
 
 This started life as **plex-hot-cache** — a Plex-specific caching layer. As the design matured, I realized that the FUSE and caching logic was the main "magic" here, so it became **fscache** and open to all services. The Plex-specific smarts (episode prediction, transcoder filtering) are still here as a preset, but the tool works just as well for any read-heavy generic file workload.
 
