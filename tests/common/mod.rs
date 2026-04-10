@@ -116,7 +116,7 @@ impl FuseHarness {
     }
 
     /// Full pipeline with a caller-supplied preset. Use this to test presets
-    /// other than PlexEpisodePrediction (e.g. CacheOnMiss) against a live FUSE mount.
+    /// other than PlexEpisodePrediction against a live FUSE mount.
     ///
     /// Must be called from inside `#[tokio::test]`.
     pub fn new_full_pipeline_with_preset(preset: Arc<dyn CachePreset>) -> anyhow::Result<Self> {

@@ -271,23 +271,6 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                     .map_err(|e| anyhow::anyhow!("[{}] prefetch preset config error: {}", mount_name, e))?,
                 )
             }
-            "cache-on-miss" => {
-                tracing::warn!(
-                    "[{}] preset \"cache-on-miss\" is deprecated — \
-                     use preset.name = \"prefetch\" with mode = \"cache-hit-only\"",
-                    mount_name
-                );
-                Arc::new(
-                    presets::prefetch::Prefetch::new(
-                        presets::prefetch::PrefetchMode::CacheHitOnly,
-                        3,
-                        config.prefetch.process_blocklist.clone(),
-                        &[],
-                        &[],
-                    )
-                    .expect("cache-hit-only with no patterns always succeeds"),
-                )
-            }
             other => {
                 tracing::warn!(
                     "[{}] Unknown preset {:?}, falling back to \"plex-episode-prediction\"",

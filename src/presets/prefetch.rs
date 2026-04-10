@@ -19,7 +19,7 @@ pub fn parse_mode(s: &str) -> anyhow::Result<PrefetchMode> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefetchMode {
-    /// Cache only the accessed file (equivalent to old cache-on-miss).
+    /// Cache only the accessed file.
     CacheHitOnly,
     CacheNeighbors,
     CacheParentRecursively,

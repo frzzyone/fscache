@@ -69,7 +69,7 @@ General-purpose preset with three caching modes and optional regex filtering. No
 
 **Modes:**
 
-- **`cache-hit-only`** — cache only the file that was accessed. Safest, no fan-out. (This is what the old `cache-on-miss` preset did.)
+- **`cache-hit-only`** — cache only the file that was accessed. Safest, no fan-out.
 - **`cache-neighbors`** — cache all sibling files in the same directory. Good for media folders where related files (episodes, artwork, metadata) live side by side.
 - **`cache-parent-recursively`** — recursively cache the entire parent directory up to `max_depth` levels deep. Aggressive, but useful when a single access should warm an entire show or album.
 
@@ -82,10 +82,6 @@ General-purpose preset with three caching modes and optional regex filtering. No
 All regex patterns are compiled at startup. Invalid patterns cause the daemon to refuse to start — no silent failures at runtime.
 
 Configured via the `[prefetch]` section.
-
-### `cache-on-miss` (deprecated)
-
-Still accepted for backward compatibility — maps to `prefetch` with `cache-hit-only` mode and no filters. Logs a deprecation warning on startup. Use `prefetch` directly for new configs.
 
 Set the preset via `[preset] name` in `config.toml`.
 
@@ -190,7 +186,7 @@ sudo cp target/release/fscache /usr/local/bin/
 
 | Setting | Default | Description |
 |---|---|---|
-| `preset.name` | `plex-episode-prediction` | `plex-episode-prediction`, `prefetch`, or `cache-on-miss` (deprecated) |
+| `preset.name` | `plex-episode-prediction` | `plex-episode-prediction` or `prefetch` |
 
 ### Plex Episode Prediction
 

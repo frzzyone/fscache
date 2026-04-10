@@ -157,7 +157,7 @@ docker exec fscache-test-consumer cat /media/TV/test-episode.bin   > /dev/null
 log "Waiting for cache writes to settle..."
 sleep 5
 
-# With cache-on-miss + min_access_secs=0, both files must be cached — hard fail
+# With prefetch (cache-hit-only) + min_access_secs=0, both files must be cached — hard fail
 CACHED_FILES=$(find "$TEST_CACHE" -type f \
     ! -name "*.db" ! -name "*.db-wal" ! -name "*.db-shm" \
     ! -name "*.lock" ! -name "*.sock" \
@@ -166,7 +166,7 @@ CACHED_FILES=$(find "$TEST_CACHE" -type f \
 if [[ "$CACHED_FILES" -gt 0 ]]; then
     pass "Cache directory has $CACHED_FILES cached file(s)"
 else
-    fail "No cached files in $TEST_CACHE — cache-on-miss preset should have written files"
+    fail "No cached files in $TEST_CACHE — prefetch preset should have written files"
     docker logs fscache-test 2>&1 | tail -30
 fi
 

@@ -4,7 +4,7 @@ cache_directory = "/mnt/ssd-cache"      # SSD cache storage (NOT the FUSE mount)
 instance_name = "plex-movies"           # Unique name for this instance — used for DB filename and process lock (alphanumeric, hyphens, underscores)
 
 [preset]
-name = "plex-episode-prediction"         # Preset to use: "plex-episode-prediction", "prefetch", or "cache-on-miss" (deprecated alias)
+name = "plex-episode-prediction"         # Preset to use: "plex-episode-prediction" or "prefetch"
 
 # ---------------------------------------------------------------------------
 # [prefetch] — only used when preset.name = "prefetch"

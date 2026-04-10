@@ -4,7 +4,14 @@ cache_directory    = "/cache"
 instance_name      = "fscache"
 
 [preset]
-name = "cache-on-miss"
+name = "prefetch"
+
+[prefetch]
+mode              = "cache-hit-only"
+max_depth         = 3
+process_blocklist = []
+file_whitelist    = []
+file_blacklist    = []
 
 [eviction]
 max_size_gb        = 10.0

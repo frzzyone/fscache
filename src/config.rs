@@ -171,7 +171,7 @@ impl Default for PrefetchConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PresetConfig {
-    /// Which preset to use: "plex-episode-prediction", "prefetch", or "cache-on-miss" (deprecated alias for prefetch cache-hit-only).
+    /// Which preset to use: "plex-episode-prediction" or "prefetch".
     #[serde(default = "default_preset_name")]
     pub name: String,
 }
