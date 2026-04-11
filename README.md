@@ -19,6 +19,7 @@ I plan on supporting this software to flesh out even more features (write cachin
 **FOR DOCKER USERS:** WE HAVE A DOCKER SPECIFIC SETUP AND IMAGE! Use this Readme!
 https://github.com/DudeCmonMan/fscache/blob/main/docker/README.md (I'm still looking for feedback on this, I don't run Plex on Docker, any testing is appreciated!)
 
+If this utility helped you, I would really appreciate a star!
 
 ## This software includes a monitor as well
 <table>
