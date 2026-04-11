@@ -21,14 +21,6 @@ https://github.com/DudeCmonMan/fscache/blob/main/docker/README.md (I'm still loo
 
 If this utility helped you, I would really appreciate a star!
 
-## This software includes a monitor as well
-<table>
-<tr>
-<td><img width="758" height="822" alt="image" src="https://github.com/user-attachments/assets/993d9b19-d354-45a9-9961-7abf9d86cc44" /></td>
-<td><img width="758" height="822" alt="image" src="https://github.com/user-attachments/assets/c149cec9-6992-4323-91a8-fe4e80aeea74" /></td>
-</tr>
-</table>
-
 # WARNING: PLEASE READ THIS BEFORE TRYING
 
 **This is a new project. I HIGHLY recommend you DISABLE automatic trash emptying in Plex while evaluating this software. Filesystem mounting/unmounting is potentially dangerous on a live server. If Plex detects a drive went down and you have automatic trash cleanup enabled, it WILL delete your Plex metadata (not the files — just watch history, ratings, etc.). My codebase has extensive automated testing that protects against this type of failure, but please be safe. If you're using this tool, you're probably hoarding data like me and I would HATE to see a critical bug break your metadata.**
@@ -137,7 +129,7 @@ sudo ./fscache
 
 That's it. The cache is active and filesystem doesn't need any changes. Stop it with `Ctrl+C` — the mount detaches cleanly. LET IT DO IT'S THING, DO NOT DOUBLE TAP CTRL+C.
 
-If you want to monitor it with the GUI, simply run ./fscache watch.
+To monitor cache activity in real time, run `./fscache watch` in a separate terminal — see [Monitoring with `fscache watch`](#monitoring-with-fscache-watch) below.
 
 ---
 
@@ -312,3 +304,56 @@ max_depth         = 3
 file_blacklist    = ["\\.nfo$", "\\.jpg$"]
 # file_whitelist  = ["\\.mkv$", "\\.mp4$"]
 ```
+
+---
+
+## Monitoring with `fscache watch`
+
+`fscache watch` attaches a terminal dashboard to a running daemon — it does not start one.
+
+```bash
+./fscache watch
+```
+
+It auto-discovers running instances. If you have multiple, use `-i <name>` to target a specific one, or `--socket <path>` for a direct socket path. The TUI detaches cleanly when you quit; the daemon keeps running.
+
+### Status page
+
+Shows the scheduler window (open/closed), a color-coded cache budget gauge, action engine state (in-flight and deferred operations), mount health, live FUSE activity counters (opens, hits, misses, bytes read), and a tail of recent log lines.
+
+### Cache page
+
+A browsable list of every cached file with sortable columns and a per-file detail pane (size, cached-at time, last read, eviction deadline). You can select individual files with `Space` or range-select with `Shift+↑↓`, then press `Enter` to open an action menu with two options:
+
+- **Evict files** — removes the selected file(s) from cache
+- **Refresh lease** — extends the eviction deadline for the selected file(s)
+
+If nothing is checked when you press `Enter`, the action applies to the highlighted row only.
+
+### Logs page
+
+Scrollable ring buffer of the 200 most recent daemon log lines, color-coded by level (error / warn / info / debug).
+
+### Key bindings
+
+| Key | Where | Action |
+|---|---|---|
+| `q` | global | detach TUI (daemon keeps running) |
+| `Ctrl+Q` | global | send shutdown to daemon, then exit |
+| `←` `→` / `1` `2` `3` | global | switch pages |
+| `↑` `↓` | Cache / Logs | move selection or scroll |
+| `Shift+↑` `Shift+↓` | Cache | range-select while moving |
+| `Space` | Cache | toggle checkbox on highlighted file |
+| `Home` `End` | Cache / Logs | jump to first / last |
+| `s` | Cache | cycle sort (newest / oldest / largest / smallest / name A–Z) |
+| `Enter` | Cache | open action menu |
+| `↑` `↓` `Enter` `Esc` | Action menu | choose action or dismiss |
+
+> More features are planned for the monitor — this is the starting set.
+
+<table>
+<tr>
+<td><img width="758" height="822" alt="image" src="https://github.com/user-attachments/assets/993d9b19-d354-45a9-9961-7abf9d86cc44" /></td>
+<td><img width="758" height="822" alt="image" src="https://github.com/user-attachments/assets/c149cec9-6992-4323-91a8-fe4e80aeea74" /></td>
+</tr>
+</table>
