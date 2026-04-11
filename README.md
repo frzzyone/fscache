@@ -107,7 +107,7 @@ Set the preset via `[preset] name` in `config.toml`.
 
 ### 1. Download and extract
 
-Grab the latest release from the [Releases page](https://github.com/DudeCmonMan/plex-hot-cache/releases) and extract it wherever you want to run it from:
+Grab the latest pre-built release from the [Releases page](https://github.com/DudeCmonMan/fscache/releases) and extract it wherever you want to run it from:
 
 ```bash
 tar -xzf fscache-*.tar.gz -C /opt/fscache
