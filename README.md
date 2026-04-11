@@ -14,6 +14,10 @@ This started life as **plex-hot-cache** — a Plex-specific caching layer. As th
 
 I plan on supporting this software to flesh out even more features (write caching, more eviction algos, more caching algos, other software integrations, etc.)
 
+**FOR DOCKER USERS:** WE HAVE A DOCKER SPECIFIC SETUP AND IMAGE! Use this Readme!
+https://github.com/DudeCmonMan/fscache/blob/main/docker/README.md
+
+
 ## This software includes a monitor as well
 <table>
 <tr>
