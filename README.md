@@ -1,5 +1,7 @@
 # fscache
 
+tl;dr: Transparent, user-configurable SSD cache for slow storage (NAS/HDD) using FUSE — no application changes required. Caches hot files locally and serves future reads from SSD.
+
 Transparent SSD caching for any read-heavy file workload — media servers, NAS-backed applications, anything that reads from slow storage. Sits between your application and a network share / drive array using a FUSE overmount — your application sees no difference, but files are silently pre-copied to local SSD before they're needed.
 
 No plugins, no API wrappers, no config changes on the application side. Drop it in, point it at your media directory, and remove it just as easily. As long as it receives a proper signal, you can stop it while your server is running. Active streams will need to be restarted, but your server won't.
