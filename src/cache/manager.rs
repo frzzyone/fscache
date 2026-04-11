@@ -2,7 +2,23 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use super::db::CacheDb;
+use super::db::{CacheDb, Fingerprint};
+use crate::backing_store::BackingStore;
+
+/// Result of a staleness check against the backing store.
+pub enum StaleResult {
+    /// Cached file matches the backing (mtime seconds, nsecs, and size all agree).
+    Fresh,
+    /// At least one fingerprint field differs — cache entry is outdated.
+    Stale,
+    /// Backing file no longer exists — cache entry is dangling.
+    BackingGone,
+    /// No DB row for this file, or no backing store configured.
+    NotTracked,
+    /// DB row exists but has a zero fingerprint (pre-migration row).
+    /// Contains the live backing stat so the caller can persist it immediately.
+    NeedsBackfill(libc::stat),
+}
 
 /// Snapshot of cache state returned by [`CacheManager::stats`].
 /// Polled by the TUI every few seconds — never called from the FUSE hot path.
@@ -31,12 +47,18 @@ pub struct CacheManager {
     /// Unique identifier for this mount's cache partition within the shared DB.
     mount_id: String,
     db: Arc<CacheDb>,
+    /// Optional backing store reference — required for staleness checks.
+    /// `None` in tests that don't need invalidation.
+    backing: Option<Arc<BackingStore>>,
+    /// Whether to run a staleness check on every FUSE cache hit.
+    check_on_hit: bool,
 }
 
 impl CacheManager {
     /// `cache_dir` is this mount's write directory.
     /// `db` is the shared instance-level database (opened once in main, shared across mounts).
     /// `capacity_check_dir` is used for drive capacity checks — typically the cache root.
+    /// `backing` is used for staleness checks; pass `None` in tests that don't need invalidation.
     pub fn new(
         cache_dir: PathBuf,
         db: Arc<CacheDb>,
@@ -44,6 +66,8 @@ impl CacheManager {
         max_size_gb: f64,
         expiry_hours: u64,
         min_free_space_gb: f64,
+        backing: Option<Arc<BackingStore>>,
+        invalidation: &crate::config::InvalidationConfig,
     ) -> Self {
         let configured = (max_size_gb * 1_073_741_824.0) as u64;
         let max_size_bytes = match total_space_bytes(&capacity_check_dir) {
@@ -69,6 +93,8 @@ impl CacheManager {
             min_free_bytes: (min_free_space_gb * 1_073_741_824.0) as u64,
             mount_id,
             db,
+            backing,
+            check_on_hit: invalidation.check_on_hit,
         };
         tracing::info!(
             "Cache manager: dir={}, max={:.1} GB, expiry={}h, min_free={:.1} GB",
@@ -98,9 +124,122 @@ impl CacheManager {
         p.exists() && !p.extension().map_or(false, |e| e == "partial")
     }
 
+    /// Unique identifier for this mount's cache partition in the shared DB.
+    pub fn mount_id(&self) -> &str {
+        &self.mount_id
+    }
+
+    /// Whether the FUSE hot-path stale check is enabled.
+    pub fn check_on_hit(&self) -> bool {
+        self.check_on_hit
+    }
+
     /// Record a successful cache population. Called by the copier task after rename.
-    pub fn mark_cached(&self, rel_path: &Path, size_bytes: u64) {
-        self.db.mark_cached(rel_path, size_bytes, &self.mount_id);
+    /// `mtime_secs` / `mtime_nsecs` are the source file's mtime at copy time (from
+    /// utimensat-preserved metadata on the cache file) — used for future staleness checks.
+    pub fn mark_cached(&self, rel_path: &Path, size_bytes: u64, mtime_secs: i64, mtime_nsecs: i64) {
+        self.db.mark_cached(rel_path, size_bytes, &self.mount_id, mtime_secs, mtime_nsecs);
+    }
+
+    /// Check whether the cached copy of `rel` is still consistent with the backing file.
+    /// Does one DB lookup + one backing stat. Returns `NotTracked` if no backing is configured.
+    pub fn is_stale(&self, rel: &Path) -> StaleResult {
+        let backing = match &self.backing {
+            Some(b) => b,
+            None => return StaleResult::NotTracked,
+        };
+        let fp = match self.db.fingerprint_row(rel, &self.mount_id) {
+            Some(f) => f,
+            None => return StaleResult::NotTracked,
+        };
+        let live = match backing.stat(rel) {
+            Some(s) => s,
+            None => return StaleResult::BackingGone,
+        };
+        if fp.source_mtime_secs == 0 && fp.source_mtime_nsecs == 0 {
+            return StaleResult::NeedsBackfill(live);
+        }
+        let stale =
+            fp.source_mtime_secs  != live.st_mtime     as i64 ||
+            fp.source_mtime_nsecs != live.st_mtime_nsec as i64 ||
+            fp.size_bytes         != live.st_size       as u64;
+        if stale { StaleResult::Stale } else { StaleResult::Fresh }
+    }
+
+    /// Like `is_stale` but uses a pre-fetched fingerprint instead of doing a DB lookup.
+    /// Used by the maintenance sweep after a bulk `all_fingerprints` query.
+    pub fn is_stale_with_fingerprint(&self, rel: &Path, fp: &Fingerprint) -> StaleResult {
+        let backing = match &self.backing {
+            Some(b) => b,
+            None => return StaleResult::NotTracked,
+        };
+        let live = match backing.stat(rel) {
+            Some(s) => s,
+            None => return StaleResult::BackingGone,
+        };
+        if fp.source_mtime_secs == 0 && fp.source_mtime_nsecs == 0 {
+            return StaleResult::NeedsBackfill(live);
+        }
+        let stale =
+            fp.source_mtime_secs  != live.st_mtime     as i64 ||
+            fp.source_mtime_nsecs != live.st_mtime_nsec as i64 ||
+            fp.size_bytes         != live.st_size       as u64;
+        if stale { StaleResult::Stale } else { StaleResult::Fresh }
+    }
+
+    /// Remove a stale cache entry — deletes the file from disk and removes the DB row.
+    /// Idempotent: ignores `ENOENT` on the file delete.
+    /// `reason` is logged as the eviction reason (e.g. `EVICTION_REASON_STALE_ON_HIT`).
+    pub fn drop_stale(&self, rel: &Path, reason: &'static str) {
+        let abs_path = self.cache_dir.join(rel);
+        match std::fs::remove_file(&abs_path) {
+            Ok(()) => {
+                tracing::info!(
+                    event = crate::telemetry::EVENT_EVICTION,
+                    path = %abs_path.display(),
+                    reason = reason,
+                    "evict ({}): {}", reason, abs_path.display(),
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Already gone — still remove the DB row.
+            }
+            Err(e) => {
+                tracing::warn!("drop_stale: failed to delete {}: {e}", abs_path.display());
+            }
+        }
+        self.db.remove(rel, &self.mount_id);
+    }
+
+    /// Backfill the fingerprint for a pre-migration row (source_mtime = 0).
+    /// Called when `is_stale` or `is_stale_with_fingerprint` returns `NeedsBackfill`.
+    pub fn backfill_fingerprint(&self, rel: &Path, st: &libc::stat) {
+        self.db.set_fingerprint(
+            rel, &self.mount_id,
+            st.st_mtime as i64, st.st_mtime_nsec as i64, st.st_size as u64,
+        );
+    }
+
+    /// Run a full stale sweep across all tracked files for this mount.
+    /// Drops stale entries, backfills zero-fingerprint rows. Returns (checked, dropped).
+    /// Called from the periodic maintenance task (in a `spawn_blocking` context).
+    pub fn sweep_stale(&self) -> (u32, u32) {
+        let rows = self.db.all_fingerprints(&self.mount_id);
+        let (mut checked, mut dropped) = (0u32, 0u32);
+        for (rel, fp) in rows {
+            match self.is_stale_with_fingerprint(&rel, &fp) {
+                StaleResult::Stale | StaleResult::BackingGone => {
+                    self.drop_stale(&rel, crate::telemetry::EVICTION_REASON_STALE_PERIODIC);
+                    dropped += 1;
+                }
+                StaleResult::NeedsBackfill(st) => {
+                    self.backfill_fingerprint(&rel, &st);
+                }
+                _ => {}
+            }
+            checked += 1;
+        }
+        (checked, dropped)
     }
 
     /// Record a cache hit. Called from FUSE open() when serving from SSD.

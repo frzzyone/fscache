@@ -372,8 +372,12 @@ pub async fn run_copier_task(
 
         match result {
             Ok(Ok(())) => {
-                let size = std::fs::metadata(&req.cache_dest).map(|m| m.len()).unwrap_or(0);
-                cache.mark_cached(&req.rel_path, size);
+                use std::os::unix::fs::MetadataExt;
+                let (size, mtime_secs, mtime_nsecs) = match std::fs::metadata(&req.cache_dest) {
+                    Ok(m) => (m.len(), m.mtime(), m.mtime_nsec()),
+                    Err(_) => (0, 0, 0),
+                };
+                cache.mark_cached(&req.rel_path, size, mtime_secs, mtime_nsecs);
                 tracing::info!(event = telemetry::EVENT_COPY_COMPLETE, path = %req.rel_path.display(), "copier: cached {}", req.rel_path.display());
             }
             Ok(Err(e)) => {
@@ -384,6 +388,39 @@ pub async fn run_copier_task(
             }
         }
         let _ = done_tx.send(req.rel_path);
+    }
+}
+
+/// Periodic maintenance task: runs a stale-file sweep (when enabled) and eviction
+/// on a fixed interval. Fixes the lazy-eviction gap where `evict_if_needed` was only
+/// called from the copier task and never ran when the copy queue was idle.
+///
+/// Spawned once per mount. Returns immediately if `poll_interval_secs == 0`.
+pub async fn run_maintenance_task(
+    cache: Arc<CacheManager>,
+    invalidation: crate::config::InvalidationConfig,
+    poll_interval_secs: u64,
+) {
+    if poll_interval_secs == 0 {
+        return;
+    }
+    let interval = Duration::from_secs(poll_interval_secs);
+    loop {
+        tokio::time::sleep(interval).await;
+
+        let cache_clone = Arc::clone(&cache);
+        let check = invalidation.check_on_maintenance;
+        tokio::task::spawn_blocking(move || {
+            if check {
+                let (checked, dropped) = cache_clone.sweep_stale();
+                tracing::info!(
+                    "maintenance stale sweep: checked={checked} dropped={dropped}"
+                );
+            }
+            cache_clone.evict_if_needed();
+        })
+        .await
+        .ok();
     }
 }
 

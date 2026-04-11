@@ -19,6 +19,8 @@ pub struct Config {
     pub schedule: ScheduleConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub invalidation: InvalidationConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -81,6 +83,11 @@ pub struct EvictionConfig {
     pub expiry_hours: u64,
     #[serde(default = "default_min_free_space_gb")]
     pub min_free_space_gb: f64,
+    /// How often the maintenance task runs, in seconds. 0 disables the loop.
+    /// Default 300 = 5 minutes. Drives both cache-invalidation sweeps and
+    /// regular eviction when no copies are in flight (fixes lazy-eviction gap).
+    #[serde(default = "default_poll_interval_secs", deserialize_with = "de_u64")]
+    pub poll_interval_secs: u64,
 }
 
 impl Default for EvictionConfig {
@@ -90,6 +97,32 @@ impl Default for EvictionConfig {
             max_size_gb: default_max_size_gb(),
             expiry_hours: default_expiry_hours(),
             min_free_space_gb: default_min_free_space_gb(),
+            poll_interval_secs: default_poll_interval_secs(),
+        }
+    }
+}
+
+/// Cache-invalidation knobs — whether to revalidate cached files against their
+/// backing counterparts on every FUSE hit and/or during the periodic sweep.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InvalidationConfig {
+    /// Check cached files against their backing counterparts on every FUSE open()
+    /// cache hit. Adds one backing stat() per hit — cheap locally, noticeable on
+    /// remote backings (SMB/NFS). Detects staleness in real time.
+    #[serde(default = "default_check_on_hit")]
+    pub check_on_hit: bool,
+    /// Check cached files against their backing counterparts during the periodic
+    /// maintenance sweep (see eviction.poll_interval_secs). Catches files that
+    /// were rewritten on the backing but haven't been accessed since.
+    #[serde(default = "default_check_on_maintenance")]
+    pub check_on_maintenance: bool,
+}
+
+impl Default for InvalidationConfig {
+    fn default() -> Self {
+        Self {
+            check_on_hit: default_check_on_hit(),
+            check_on_maintenance: default_check_on_maintenance(),
         }
     }
 }
@@ -263,6 +296,9 @@ fn default_window_end() -> String { "02:00".to_string() }
 fn default_eviction_strategy() -> String { "lru".to_string() }
 fn default_prefetch_mode() -> String { "cache-hit-only".to_string() }
 fn default_max_depth() -> usize { 3 }
+fn default_poll_interval_secs() -> u64 { 300 }
+fn default_check_on_hit() -> bool { false }
+fn default_check_on_maintenance() -> bool { true }
 
 /// Accept both `10` and `10.0` in u64 fields — TOML floats are silently truncated.
 fn de_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {

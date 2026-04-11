@@ -138,7 +138,7 @@ fn orphaned_partial_is_cleaned_and_invisible() {
 
     // CacheManager startup_cleanup should remove the .partial
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
-    let mgr = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0));
+    let mgr = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default()));
     mgr.startup_cleanup();
     assert!(!partial.exists(), ".partial must be removed by startup_cleanup");
 
@@ -188,7 +188,7 @@ fn fuse_falls_back_to_backing_on_cache_miss() {
     std::fs::write(cache_dir.path().join("cached.mkv"), b"ssdcached_A").unwrap(); // 11 bytes
 
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
-    let mgr = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0));
+    let mgr = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default()));
     let mut fs = fscache::fuse::fusefs::FsCache::new(backing.path()).unwrap();
     fs.cache = Some(std::sync::Arc::clone(&mgr));
 

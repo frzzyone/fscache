@@ -3,6 +3,7 @@ use common::{write_backing_file, FuseHarness};
 use std::path::PathBuf;
 use std::sync::Arc;
 use fscache::cache::db::CacheDb;
+use fscache::cache::manager::StaleResult;
 
 // ---- helpers ----
 
@@ -120,6 +121,8 @@ fn passthrough_mode_bypasses_cache() {
         1.0,
         72,
         0.0,
+        None,
+        &Default::default(),
     )));
 
     let mut config = fuser::Config::default();
@@ -151,7 +154,7 @@ fn startup_cleanup_removes_partials() {
     std::fs::write(&cached, b"complete").unwrap();
 
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
-    let mgr = CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0);
+    let mgr = CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default());
     mgr.startup_cleanup();
 
     assert!(!partial.exists(), ".partial file should have been removed by startup_cleanup");
@@ -181,13 +184,15 @@ fn size_eviction_removes_oldest_files() {
         1000.0 / 1_073_741_824.0,
         9999,
         0.0,
+        None,
+        &Default::default(),
     );
 
     // Register files in the DB. Give old_file an earlier last_hit_at so it
     // is chosen as the LRU eviction candidate.
     let mount_id = cache_dir.path().to_string_lossy().into_owned();
-    mgr.mark_cached(Path::new("old.mkv"), 600);
-    mgr.mark_cached(Path::new("new.mkv"), 600);
+    mgr.mark_cached(Path::new("old.mkv"), 600, 0, 0);
+    mgr.mark_cached(Path::new("new.mkv"), 600, 0, 0);
     let db = mgr.cache_db();
     let old_ts = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -225,12 +230,14 @@ fn expiry_eviction_removes_expired_files() {
         1.0,
         1, // 1 hour expiry
         0.0,
+        None,
+        &Default::default(),
     );
 
     // Register both files. Back-date expired's last_hit_at to 2 hours ago.
     let mount_id = cache_dir.path().to_string_lossy().into_owned();
-    mgr.mark_cached(Path::new("expired.mkv"), 8);
-    mgr.mark_cached(Path::new("fresh.mkv"), 8);
+    mgr.mark_cached(Path::new("expired.mkv"), 8, 0, 0);
+    mgr.mark_cached(Path::new("fresh.mkv"), 8, 0, 0);
     let db = mgr.cache_db();
     let two_hours_ago = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -266,9 +273,184 @@ fn freshly_cached_file_with_old_mtime_survives_eviction() {
         1.0,
         72,
         0.0,
+        None,
+        &Default::default(),
     );
-    mgr.mark_cached(Path::new("episode.mkv"), 4);
+    mgr.mark_cached(Path::new("episode.mkv"), 4, 0, 0);
     mgr.evict_if_needed();
 
     assert!(cached.exists(), "freshly cached file should not be evicted");
+}
+
+// ---------------------------------------------------------------------------
+// Cache invalidation: is_stale unit tests
+// ---------------------------------------------------------------------------
+
+/// Helper: create a CacheManager backed by a real BackingStore (needed for is_stale).
+fn make_stale_harness() -> (
+    tempfile::TempDir,  // backing dir
+    tempfile::TempDir,  // cache dir
+    fscache::cache::manager::CacheManager,
+) {
+    use fscache::backing_store::BackingStore;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let backing_dir = tempfile::TempDir::new().unwrap();
+    let cache_dir   = tempfile::TempDir::new().unwrap();
+
+    let c = CString::new(backing_dir.path().as_os_str().as_bytes()).unwrap();
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_DIRECTORY) };
+    assert!(fd >= 0, "failed to open backing dir O_PATH fd");
+    let backing_store = Arc::new(BackingStore::new(fd));
+
+    let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
+    let mgr = fscache::cache::manager::CacheManager::new(
+        cache_dir.path().to_path_buf(),
+        db,
+        cache_dir.path().to_path_buf(),
+        1.0,
+        72,
+        0.0,
+        Some(backing_store),
+        &Default::default(),
+    );
+    (backing_dir, cache_dir, mgr)
+}
+
+/// Write a file to the backing dir and register it in the cache DB with real mtime.
+fn register_backing_file(
+    backing_dir: &tempfile::TempDir,
+    mgr: &fscache::cache::manager::CacheManager,
+    rel: &str,
+    content: &[u8],
+) {
+    let backing_path = backing_dir.path().join(rel);
+    if let Some(p) = backing_path.parent() { std::fs::create_dir_all(p).unwrap(); }
+    std::fs::write(&backing_path, content).unwrap();
+
+    // Read live mtime from backing file to populate fingerprint correctly.
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(&backing_path).unwrap();
+    let cache_path = mgr.cache_path(std::path::Path::new(rel));
+    if let Some(p) = cache_path.parent() { std::fs::create_dir_all(p).unwrap(); }
+    std::fs::write(&cache_path, content).unwrap();
+    mgr.mark_cached(std::path::Path::new(rel), m.len(), m.mtime(), m.mtime_nsec());
+}
+
+#[test]
+fn is_stale_returns_fresh_after_copy() {
+    let (backing_dir, _cache_dir, mgr) = make_stale_harness();
+    register_backing_file(&backing_dir, &mgr, "episode.mkv", b"video data");
+
+    let result = mgr.is_stale(std::path::Path::new("episode.mkv"));
+    assert!(matches!(result, StaleResult::Fresh), "newly cached file should be Fresh");
+}
+
+#[test]
+fn is_stale_returns_stale_after_mtime_change() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let (backing_dir, _cache_dir, mgr) = make_stale_harness();
+    register_backing_file(&backing_dir, &mgr, "episode.mkv", b"original data");
+
+    // Wind the backing file's mtime forward by 60 seconds.
+    let backing_path = backing_dir.path().join("episode.mkv");
+    let m = std::fs::metadata(&backing_path).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    let new_mtime = UNIX_EPOCH + Duration::from_secs(m.mtime() as u64 + 60);
+    filetime::set_file_mtime(&backing_path, filetime::FileTime::from_system_time(new_mtime)).unwrap();
+
+    let result = mgr.is_stale(std::path::Path::new("episode.mkv"));
+    assert!(matches!(result, StaleResult::Stale), "file with changed mtime should be Stale");
+}
+
+#[test]
+fn is_stale_returns_stale_after_size_change() {
+    let (backing_dir, _cache_dir, mgr) = make_stale_harness();
+    register_backing_file(&backing_dir, &mgr, "episode.mkv", b"original");
+
+    // Overwrite backing with different-size content but force original mtime back.
+    let backing_path = backing_dir.path().join("episode.mkv");
+    use std::os::unix::fs::MetadataExt;
+    let original_mtime_secs = std::fs::metadata(&backing_path).unwrap().mtime();
+
+    std::fs::write(&backing_path, b"longer backing content than before").unwrap();
+
+    // Reset mtime to original value to isolate the size signal.
+    let original_ft = filetime::FileTime::from_unix_time(original_mtime_secs, 0);
+    filetime::set_file_mtime(&backing_path, original_ft).unwrap();
+
+    let result = mgr.is_stale(std::path::Path::new("episode.mkv"));
+    assert!(matches!(result, StaleResult::Stale), "file with changed size should be Stale");
+}
+
+#[test]
+fn is_stale_returns_backing_gone_after_delete() {
+    let (backing_dir, _cache_dir, mgr) = make_stale_harness();
+    register_backing_file(&backing_dir, &mgr, "episode.mkv", b"data");
+
+    std::fs::remove_file(backing_dir.path().join("episode.mkv")).unwrap();
+
+    let result = mgr.is_stale(std::path::Path::new("episode.mkv"));
+    assert!(matches!(result, StaleResult::BackingGone), "deleted backing file should be BackingGone");
+}
+
+#[test]
+fn is_stale_returns_needs_backfill_for_zero_fingerprint() {
+    let (backing_dir, cache_dir, mgr) = make_stale_harness();
+    let backing_path = backing_dir.path().join("episode.mkv");
+    let cache_path   = cache_dir.path().join("episode.mkv");
+    std::fs::write(&backing_path, b"data").unwrap();
+    std::fs::write(&cache_path,   b"data").unwrap();
+
+    // Register with zero fingerprint to simulate a pre-migration row.
+    mgr.mark_cached(std::path::Path::new("episode.mkv"), 4, 0, 0);
+
+    let result = mgr.is_stale(std::path::Path::new("episode.mkv"));
+    assert!(matches!(result, StaleResult::NeedsBackfill(_)),
+        "zero-fingerprint row should be NeedsBackfill");
+
+    // Backfill, then the next check should be Fresh.
+    if let StaleResult::NeedsBackfill(st) = result {
+        mgr.backfill_fingerprint(std::path::Path::new("episode.mkv"), &st);
+    }
+    assert!(matches!(mgr.is_stale(std::path::Path::new("episode.mkv")), StaleResult::Fresh),
+        "after backfill, file should be Fresh");
+}
+
+#[test]
+fn maintenance_evict_if_needed_runs_without_copies() {
+    // Regression: evict_if_needed must fire even when no copies are in flight.
+    // Simulates the lazy-eviction gap that the maintenance task fixes.
+    use std::path::Path;
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let expired = cache_dir.path().join("expired.mkv");
+    std::fs::write(&expired, b"old").unwrap();
+
+    let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
+    let mgr = fscache::cache::manager::CacheManager::new(
+        cache_dir.path().to_path_buf(),
+        Arc::clone(&db),
+        cache_dir.path().to_path_buf(),
+        1.0,
+        1,   // 1 hour expiry
+        0.0,
+        None,
+        &Default::default(),
+    );
+    mgr.mark_cached(Path::new("expired.mkv"), 3, 0, 0);
+
+    // Back-date last_hit_at to 2 hours ago.
+    let mount_id = cache_dir.path().to_string_lossy().into_owned();
+    let two_hours_ago = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64) - 7200;
+    db.set_last_hit_at_for_test(Path::new("expired.mkv"), &mount_id, two_hours_ago);
+
+    // No copier is running — call evict_if_needed directly (as maintenance task would).
+    mgr.evict_if_needed();
+
+    assert!(!expired.exists(), "evict_if_needed should remove expired file without copier");
 }

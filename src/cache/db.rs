@@ -5,6 +5,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
 
+/// Snapshot of a file's source-side identity at copy time.
+/// Used to detect whether a backing file has been rewritten since it was cached.
+/// Three signals: mtime seconds, mtime nanoseconds, and size in bytes.
+/// All three being zero means a pre-migration row — treat as needing backfill.
+#[derive(Debug, Clone, Copy)]
+pub struct Fingerprint {
+    pub source_mtime_secs: i64,
+    pub source_mtime_nsecs: i64,
+    pub size_bytes: u64,
+}
+
 /// SQLite-backed cache metadata store.
 ///
 /// Tracks which files are cached (for eviction intelligence) and persists
@@ -41,24 +52,39 @@ impl CacheDb {
                 timestamp   INTEGER NOT NULL
             );
         "#)?;
-        // Migration: add hit_count to existing databases (silently ignored if already present).
+        // Additive migrations — silently ignored if column already present.
         let _ = conn.execute_batch(
             "ALTER TABLE cache_files ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0",
+        );
+        let _ = conn.execute_batch(
+            "ALTER TABLE cache_files ADD COLUMN source_mtime_secs  INTEGER NOT NULL DEFAULT 0",
+        );
+        let _ = conn.execute_batch(
+            "ALTER TABLE cache_files ADD COLUMN source_mtime_nsecs INTEGER NOT NULL DEFAULT 0",
         );
         Ok(Self { conn: Mutex::new(conn) })
     }
 
     // ---- cache file tracking ----
 
-    pub fn mark_cached(&self, rel_path: &Path, size_bytes: u64, mount_id: &str) {
+    pub fn mark_cached(
+        &self,
+        rel_path: &Path,
+        size_bytes: u64,
+        mount_id: &str,
+        source_mtime_secs: i64,
+        source_mtime_nsecs: i64,
+    ) {
         let now = now_secs() as i64;
         let key = rel_path.to_string_lossy();
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
             "INSERT OR REPLACE INTO cache_files \
-             (rel_path, mount_id, size_bytes, cached_at, last_hit_at, hit_count) \
-             VALUES (?1, ?2, ?3, ?4, ?4, 1)",
-            params![key.as_ref(), mount_id, size_bytes as i64, now],
+             (rel_path, mount_id, size_bytes, cached_at, last_hit_at, hit_count, \
+              source_mtime_secs, source_mtime_nsecs) \
+             VALUES (?1, ?2, ?3, ?4, ?4, 1, ?5, ?6)",
+            params![key.as_ref(), mount_id, size_bytes as i64, now,
+                    source_mtime_secs, source_mtime_nsecs],
         );
         tracing::info!(event = crate::telemetry::EVENT_DB_INSERT, path = %rel_path.display(), size_bytes, "db: mark_cached {}", rel_path.display());
     }
@@ -344,6 +370,91 @@ impl CacheDb {
             (p, (t_cached, t_last))
         })
         .collect()
+    }
+
+    // ---- cache invalidation: fingerprint queries ----
+
+    /// Fetch the stored fingerprint for a single file (one-row DB lookup).
+    /// Returns `None` if the file is not tracked.
+    pub fn fingerprint_row(&self, rel_path: &Path, mount_id: &str) -> Option<Fingerprint> {
+        let key = rel_path.to_string_lossy();
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT source_mtime_secs, source_mtime_nsecs, size_bytes \
+             FROM cache_files WHERE rel_path = ?1 AND mount_id = ?2",
+            params![key.as_ref(), mount_id],
+            |row| {
+                let secs: i64 = row.get(0)?;
+                let nsecs: i64 = row.get(1)?;
+                let size: i64 = row.get(2)?;
+                Ok(Fingerprint {
+                    source_mtime_secs: secs,
+                    source_mtime_nsecs: nsecs,
+                    size_bytes: size.max(0) as u64,
+                })
+            },
+        ).ok()
+    }
+
+    /// Fetch fingerprints for all tracked files in a mount in a single bulk query.
+    /// Used by the maintenance sweep to avoid per-file DB round-trips.
+    pub fn all_fingerprints(&self, mount_id: &str) -> Vec<(PathBuf, Fingerprint)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT rel_path, source_mtime_secs, source_mtime_nsecs, size_bytes \
+             FROM cache_files WHERE mount_id = ?1",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(params![mount_id], |row| {
+            let path: String = row.get(0)?;
+            let secs: i64    = row.get(1)?;
+            let nsecs: i64   = row.get(2)?;
+            let size: i64    = row.get(3)?;
+            Ok((PathBuf::from(path), Fingerprint {
+                source_mtime_secs: secs,
+                source_mtime_nsecs: nsecs,
+                size_bytes: size.max(0) as u64,
+            }))
+        })
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect()
+    }
+
+    /// Write or overwrite the fingerprint columns for a tracked file.
+    /// Used to lazy-backfill pre-migration rows and to update after re-copy.
+    pub fn set_fingerprint(
+        &self,
+        rel_path: &Path,
+        mount_id: &str,
+        secs: i64,
+        nsecs: i64,
+        size: u64,
+    ) {
+        let key = rel_path.to_string_lossy();
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE cache_files \
+             SET source_mtime_secs = ?1, source_mtime_nsecs = ?2, size_bytes = ?3 \
+             WHERE rel_path = ?4 AND mount_id = ?5",
+            params![secs, nsecs, size as i64, key.as_ref(), mount_id],
+        );
+    }
+
+    /// Test helper: same as `set_fingerprint`, named for symmetry with
+    /// `set_last_hit_at_for_test`.
+    pub fn set_fingerprint_for_test(
+        &self,
+        rel_path: &Path,
+        mount_id: &str,
+        secs: i64,
+        nsecs: i64,
+        size: u64,
+    ) {
+        self.set_fingerprint(rel_path, mount_id, secs, nsecs, size);
     }
 
     /// Directly set `last_hit_at` for a cached file. Used in tests to simulate

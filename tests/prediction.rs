@@ -130,6 +130,8 @@ async fn predictor_caches_next_episodes_via_regex() {
         1.0,
         72,
         0.0,
+        None,
+        &Default::default(),
     ));
 
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
@@ -183,6 +185,8 @@ async fn predictor_skips_already_cached() {
         1.0,
         72,
         0.0,
+        None,
+        &Default::default(),
     ));
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
     let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(32);
@@ -244,7 +248,7 @@ async fn regex_crosses_season_boundary_structured_layout() {
 
     let backing_store = make_backing_store(backing.path());
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
-    let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0));
+    let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default()));
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
     let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(32);
     let engine = make_engine(access_rx, copy_tx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0);
@@ -280,7 +284,7 @@ async fn regex_crosses_season_boundary_flat_layout() {
 
     let backing_store = make_backing_store(backing.path());
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
-    let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0));
+    let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default()));
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
     let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(32);
     let engine = make_engine(access_rx, copy_tx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0);
@@ -338,7 +342,7 @@ async fn predictor_budget_zero_means_disabled() {
 
     let backing_store = make_backing_store(backing.path());
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
-    let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0));
+    let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default()));
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
     let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(32);
     let engine = make_engine(access_rx, copy_tx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0);
@@ -367,7 +371,7 @@ async fn predictor_respects_max_cache_pull_budget() {
 
     let backing_store = make_backing_store(backing.path());
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
-    let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0));
+    let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default()));
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
     let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(32);
     let engine = make_engine(access_rx, copy_tx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 250);
@@ -397,7 +401,7 @@ async fn predictor_first_candidate_always_queued() {
 
     let backing_store = make_backing_store(backing.path());
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
-    let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0));
+    let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default()));
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
     let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(32);
     let engine = make_engine(access_rx, copy_tx, Arc::clone(&cache), 2, Arc::clone(&backing_store), 50);
@@ -429,7 +433,7 @@ async fn predictor_budget_includes_existing_cache() {
 
     let backing_store = make_backing_store(backing.path());
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
-    let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0));
+    let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default()));
     // Reconcile the pre-placed E02 into the DB so total_cached_bytes() accounts for it.
     cache.startup_cleanup();
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();

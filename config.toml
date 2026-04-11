@@ -35,7 +35,25 @@ process_blocklist = ["Plex Media Scanner", "Plex EAE Service", "Plex Media Finge
 max_size_gb = 200.0                      # Total cache budget across ALL backing mounts combined
 expiry_hours = 72                        # Delete cached files not accessed within this window
 min_free_space_gb = 10.0                 # Stop caching if SSD free space drops below this
+poll_interval_secs = 300                 # How often the maintenance task runs (seconds). Drives eviction
+                                         # sweeps and on-maintenance invalidation. Set 0 to disable.
 # strategy = "lru"                       # Eviction strategy — only "lru" supported (reserved for future use)
+
+# ---------------------------------------------------------------------------
+# [invalidation] — cache consistency against backing file mutations
+# ---------------------------------------------------------------------------
+[invalidation]
+# Check cached files against their backing counterparts on every FUSE open()
+# cache hit. Adds one backing stat() per hit — cheap locally, noticeable on
+# remote backings (SMB/NFS). Detects staleness in real time.
+check_on_hit = false
+
+# Check cached files against their backing counterparts during the periodic
+# maintenance sweep (see eviction.poll_interval_secs). Catches files that
+# were rewritten on the backing but haven't been accessed since. Bounded
+# detection latency of one poll interval. Default on — the sweep runs off the
+# hot path, so the correctness benefit is free for most users.
+check_on_maintenance = true
 
 [cache]
 # max_size_gb, expiry_hours, min_free_space_gb have moved to [eviction] above.

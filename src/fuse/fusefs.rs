@@ -16,7 +16,7 @@ use fuser::{
     ReplyEntry, ReplyOpen, Request,
 };
 
-use crate::cache::manager::CacheManager;
+use crate::cache::manager::{CacheManager, StaleResult};
 use super::inode::InodeTable;
 use crate::engine::action::AccessEvent;
 
@@ -273,27 +273,54 @@ impl Filesystem for FsCache {
         if !self.passthrough_mode {
             if let Some(ref cache) = self.cache {
                 if cache.is_cached(&path) {
-                    let cache_path = cache.cache_path(&path);
-                    let c = path_to_cstring_abs(&cache_path);
-                    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY) };
-                    if fd >= 0 {
-                        // Always log cache hits at INFO — they confirm the cache is working
-                        // and should never be suppressed by the repeat log window.
-                        tracing::info!(event = telemetry::EVENT_CACHE_HIT, path = %path.display(), "cache HIT: {:?} (serving from SSD)", path);
-                        // Update LRU timestamp in DB (non-blocking; best-effort).
-                        cache.mark_hit(&path);
-                        if !filtered {
-                            if let Some(ref tx) = self.access_tx {
-                                let _ = tx.send(AccessEvent::hit(path.clone()));
+                    // Stale check (opt-in via check_on_hit = true in config).
+                    // Sets open_from_cache = false if the entry is stale so we fall
+                    // through to the backing store after dropping the cache file.
+                    let mut open_from_cache = true;
+
+                    if cache.check_on_hit() {
+                        match cache.is_stale(&path) {
+                            StaleResult::Stale | StaleResult::BackingGone => {
+                                tracing::info!(
+                                    event = telemetry::EVENT_EVICTION,
+                                    path = %path.display(),
+                                    reason = telemetry::EVICTION_REASON_STALE_ON_HIT,
+                                    "stale cache drop on hit: {:?}", path,
+                                );
+                                cache.drop_stale(&path, telemetry::EVICTION_REASON_STALE_ON_HIT);
+                                open_from_cache = false;
                             }
-                            self.open_paths.lock().unwrap().insert(fd as u64, path.clone());
+                            StaleResult::NeedsBackfill(st) => {
+                                // Pre-migration row — backfill and serve from cache.
+                                cache.backfill_fingerprint(&path, &st);
+                            }
+                            StaleResult::Fresh | StaleResult::NotTracked => {}
                         }
-                        self.open_bytes.lock().unwrap().insert(fd as u64, 0);
-                        reply.opened(FileHandle(fd as u64), FopenFlags::empty());
-                        return;
                     }
-                    // Cache file vanished between check and open — fall through to backing store.
-                    tracing::warn!("cache hit race for {:?}, falling back to backing store", path);
+
+                    if open_from_cache {
+                        let cache_path = cache.cache_path(&path);
+                        let c = path_to_cstring_abs(&cache_path);
+                        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY) };
+                        if fd >= 0 {
+                            // Always log cache hits at INFO — they confirm the cache is working
+                            // and should never be suppressed by the repeat log window.
+                            tracing::info!(event = telemetry::EVENT_CACHE_HIT, path = %path.display(), "cache HIT: {:?} (serving from SSD)", path);
+                            // Update LRU timestamp in DB (non-blocking; best-effort).
+                            cache.mark_hit(&path);
+                            if !filtered {
+                                if let Some(ref tx) = self.access_tx {
+                                    let _ = tx.send(AccessEvent::hit(path.clone()));
+                                }
+                                self.open_paths.lock().unwrap().insert(fd as u64, path.clone());
+                            }
+                            self.open_bytes.lock().unwrap().insert(fd as u64, 0);
+                            reply.opened(FileHandle(fd as u64), FopenFlags::empty());
+                            return;
+                        }
+                        // Cache file vanished between check and open — fall through.
+                        tracing::warn!("cache hit race for {:?}, falling back to backing store", path);
+                    }
                 }
             }
         }

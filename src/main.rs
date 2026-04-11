@@ -292,6 +292,8 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             eviction.max_size_gb,
             eviction.expiry_hours,
             eviction.min_free_space_gb,
+            Some(Arc::clone(&fs.backing_store)),
+            &config.invalidation,
         ));
         cache_manager.startup_cleanup();
         fs.cache = Some(Arc::clone(&cache_manager));
@@ -321,10 +323,17 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         );
         tokio::spawn(engine.run());
         tokio::spawn(engine::action::run_copier_task(
-            backing_store,
+            Arc::clone(&backing_store),
             copy_rx,
             Arc::clone(&cache_manager),
         ));
+        if config.eviction.poll_interval_secs > 0 {
+            tokio::spawn(engine::action::run_maintenance_task(
+                Arc::clone(&cache_manager),
+                config.invalidation.clone(),
+                config.eviction.poll_interval_secs,
+            ));
+        }
 
         tracing::info!("[{}] Mounting FUSE over {}", mount_name, target.display());
         let session = fuser::spawn_mount2(fs, target, &fuse_config).map_err(|e| {

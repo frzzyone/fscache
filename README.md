@@ -221,6 +221,16 @@ Used when `preset.name` is `prefetch`.
 | `eviction.max_size_gb` | `200.0` | Max total SSD cache size across all mounts |
 | `eviction.expiry_hours` | `72` | Remove cached files not accessed within this window |
 | `eviction.min_free_space_gb` | `10.0` | Stop caching if SSD free space drops below this |
+| `eviction.poll_interval_secs` | `300` | How often the background maintenance task runs (seconds). Drives eviction sweeps and on-maintenance invalidation. Set `0` to disable. |
+
+### Invalidation
+
+Detects and discards cached files whose backing source has been rewritten (e.g. by rsync, re-encode, or a fresh download).
+
+| Setting | Default | Description |
+|---|---|---|
+| `invalidation.check_on_hit` | `false` | Revalidate against the backing file on every FUSE cache hit. Adds one `stat()` per hit — negligible on local storage, may be noticeable on SMB/NFS at scale. Detects staleness in real time. |
+| `invalidation.check_on_maintenance` | `true` | Revalidate during the periodic maintenance sweep. Catches idle files that were overwritten on the backing store since they were cached. Detection latency ≤ `eviction.poll_interval_secs`. |
 
 ### Cache
 
@@ -269,9 +279,14 @@ mode              = "miss-only"
 process_blocklist = ["Plex Media Scanner", "Plex EAE Service", "Plex Media Fingerprinter"]
 
 [eviction]
-max_size_gb       = 200.0
-expiry_hours      = 72
-min_free_space_gb = 10.0
+max_size_gb         = 200.0
+expiry_hours        = 72
+min_free_space_gb   = 10.0
+poll_interval_secs  = 300
+
+[invalidation]
+check_on_hit         = false
+check_on_maintenance = true
 
 [cache]
 passthrough_mode            = false

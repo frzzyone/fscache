@@ -284,6 +284,8 @@ fn global_eviction_respects_total_budget() {
         budget_gb,
         9999,
         0.0,
+        None,
+        &Default::default(),
     );
     let mgr1 = CacheManager::new(
         harness.cache_subdir(1),
@@ -292,6 +294,8 @@ fn global_eviction_respects_total_budget() {
         budget_gb,
         9999,
         0.0,
+        None,
+        &Default::default(),
     );
 
     // Register all files in the DB so eviction candidates are visible.
@@ -303,7 +307,7 @@ fn global_eviction_respects_total_budget() {
         for file_idx in 0..2u32 {
             let rel_str = format!("file{file_idx}.mkv");
             let rel = std::path::Path::new(&rel_str);
-            mgr.mark_cached(rel, content.len() as u64);
+            mgr.mark_cached(rel, content.len() as u64, 0, 0);
             // Stagger timestamps so LRU ordering is deterministic.
             let ts = now - (mount_idx as i64 * 2 + file_idx as i64) * 10;
             let mount_id = harness.cache_subdir(mount_idx).to_string_lossy().into_owned();

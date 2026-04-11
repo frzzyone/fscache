@@ -5,6 +5,7 @@ use fuser::{MountOption, SessionACL};
 use fscache::engine::action::{run_copier_task, AccessEvent, ActionEngine, CopyRequest};
 use fscache::cache::db::CacheDb;
 use fscache::cache::manager::CacheManager;
+use fscache::config::InvalidationConfig;
 use fscache::fuse::fusefs::FsCache;
 use fscache::preset::CachePreset;
 use fscache::presets::plex_episode_prediction::PlexEpisodePrediction;
@@ -33,6 +34,8 @@ pub struct FuseHarness {
     pub mount: TempDir,
     /// Optional separate cache dir for cache overlay tests.
     pub cache: Option<TempDir>,
+    /// Exposed for tests that need to call sweep_stale(), mark_cached(), etc. directly.
+    pub cache_mgr: Option<Arc<CacheManager>>,
     /// Kept alive to hold the FUSE mount; dropped at end of test to unmount.
     _session: fuser::BackgroundSession,
 }
@@ -50,6 +53,7 @@ impl FuseHarness {
             backing,
             mount,
             cache: None,
+            cache_mgr: None,
             _session: session,
         })
     }
@@ -70,6 +74,8 @@ impl FuseHarness {
             max_size_gb,
             expiry_hours,
             0.0, // no min-free-space check in tests
+            None,
+            &InvalidationConfig::default(),
         ));
         cache_mgr.startup_cleanup();
         fs.cache = Some(Arc::clone(&cache_mgr));
@@ -80,8 +86,56 @@ impl FuseHarness {
             backing,
             mount,
             cache: Some(cache_dir),
+            cache_mgr: Some(Arc::clone(&cache_mgr)),
             _session: session,
         })
+    }
+
+    /// Harness with a cache overlay and a fully-wired `CacheManager` (backing store connected),
+    /// matching the production setup in `main.rs`. Required for E2E invalidation tests where
+    /// `is_stale()` must be able to stat the backing file.
+    pub fn new_with_cache_and_invalidation(
+        max_size_gb: f64,
+        expiry_hours: u64,
+        invalidation: &InvalidationConfig,
+    ) -> anyhow::Result<Self> {
+        let backing = TempDir::new()?;
+        let mount = TempDir::new()?;
+        let cache_dir = TempDir::new()?;
+
+        let mut fs = FsCache::new(backing.path())?;
+        // Wire backing_store into CacheManager — matches main.rs production setup.
+        // This is what makes is_stale() able to stat the backing file.
+        let backing_store = Arc::clone(&fs.backing_store);
+        let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db"))?);
+        let cache_mgr = Arc::new(CacheManager::new(
+            cache_dir.path().to_path_buf(),
+            db,
+            cache_dir.path().to_path_buf(),
+            max_size_gb,
+            expiry_hours,
+            0.0,
+            Some(backing_store),
+            invalidation,
+        ));
+        cache_mgr.startup_cleanup();
+        fs.cache = Some(Arc::clone(&cache_mgr));
+
+        let session = fuser::spawn_mount2(fs, mount.path(), &test_fuse_config())?;
+
+        Ok(Self {
+            backing,
+            mount,
+            cache: Some(cache_dir),
+            cache_mgr: Some(Arc::clone(&cache_mgr)),
+            _session: session,
+        })
+    }
+
+    /// Returns the `CacheManager` for this harness.
+    /// Panics if the harness was created without a cache (e.g. via `new()`).
+    pub fn cache_mgr(&self) -> &Arc<CacheManager> {
+        self.cache_mgr.as_ref().expect("harness has no cache manager")
     }
 
     pub fn backing_path(&self) -> &Path {
@@ -136,6 +190,8 @@ impl FuseHarness {
             1.0,
             72,
             0.0,
+            None,
+            &InvalidationConfig::default(),
         ));
         cache_mgr.startup_cleanup();
         fs.cache = Some(Arc::clone(&cache_mgr));
@@ -166,6 +222,7 @@ impl FuseHarness {
             backing,
             mount,
             cache: Some(cache_dir),
+            cache_mgr: Some(Arc::clone(&cache_mgr)),
             _session: session,
         })
     }
@@ -223,6 +280,8 @@ impl OvermountHarness {
             1.0,
             72,
             0.0,
+            None,
+            &InvalidationConfig::default(),
         ));
         cache_mgr.startup_cleanup();
         fs.cache = Some(Arc::clone(&cache_mgr));
@@ -308,12 +367,14 @@ impl MultiFuseHarness {
                 max_size_gb,
                 expiry_hours,
                 0.0,
+                None,
+                &InvalidationConfig::default(),
             ));
             cache_mgr.startup_cleanup();
             fs.cache = Some(Arc::clone(&cache_mgr));
 
             let session = fuser::spawn_mount2(fs, mount.path(), &test_fuse_config())?;
-            mounts.push(FuseHarness { backing, mount, cache: None, _session: session });
+            mounts.push(FuseHarness { backing, mount, cache: None, cache_mgr: Some(Arc::clone(&cache_mgr)), _session: session });
         }
         Ok(Self { mounts, shared_cache_base })
     }
@@ -343,6 +404,8 @@ impl MultiFuseHarness {
                 1.0,
                 72,
                 0.0,
+                None,
+                &InvalidationConfig::default(),
             ));
             cache_mgr.startup_cleanup();
             fs.cache = Some(Arc::clone(&cache_mgr));
@@ -368,7 +431,7 @@ impl MultiFuseHarness {
             tokio::spawn(run_copier_task(backing_store, copy_rx, Arc::clone(&cache_mgr)));
 
             let session = fuser::spawn_mount2(fs, mount.path(), &test_fuse_config())?;
-            mounts.push(FuseHarness { backing, mount, cache: None, _session: session });
+            mounts.push(FuseHarness { backing, mount, cache: None, cache_mgr: Some(Arc::clone(&cache_mgr)), _session: session });
         }
         Ok(Self { mounts, shared_cache_base })
     }
