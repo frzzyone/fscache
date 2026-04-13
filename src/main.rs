@@ -304,29 +304,29 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
 
         let backing_store = Arc::clone(&fs.backing_store);
 
-        let cache_io = cache::io::CacheIO::spawn(
-            cache::io::CacheIoConfig {
-                max_concurrent_copies: config.cache.max_concurrent_copies,
-                copy_queue_depth: config.cache.copy_queue_depth,
-                eviction_interval_secs: config.eviction.poll_interval_secs,
-            },
-            Arc::clone(&cache_manager),
-            Arc::clone(&backing_store),
-        );
-
         let scheduler = engine::scheduler::Scheduler::new(
             &config.schedule.cache_window_start,
             &config.schedule.cache_window_end,
         )?;
+
+        let cache_io = cache::io::CacheIO::spawn(
+            cache::io::CacheIoConfig {
+                max_concurrent_copies: config.cache.max_concurrent_copies,
+                eviction_interval_secs: config.eviction.poll_interval_secs,
+                deferred_ttl_minutes: config.cache.deferred_ttl_minutes,
+            },
+            Arc::clone(&cache_manager),
+            Arc::clone(&backing_store),
+            scheduler,
+        );
+
         let engine = engine::action::ActionEngine::new(
             access_rx,
             cache_io,
             Arc::clone(&cache_manager),
             Some(preset),
-            scheduler,
             Arc::clone(&backing_store),
             max_cache_pull_bytes,
-            config.cache.deferred_ttl_minutes,
             config.cache.min_access_secs,
             config.cache.min_file_size_mb,
         );

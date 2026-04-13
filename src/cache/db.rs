@@ -7,8 +7,7 @@ use rusqlite::{Connection, params};
 
 /// Snapshot of a file's source-side identity at copy time.
 /// Used to detect whether a backing file has been rewritten since it was cached.
-/// Three signals: mtime seconds, mtime nanoseconds, and size in bytes.
-/// All three being zero means a pre-migration row — treat as needing backfill.
+/// All three fields being zero means a pre-migration row — treat as needing backfill.
 #[derive(Debug, Clone, Copy)]
 pub struct Fingerprint {
     pub source_mtime_secs: i64,
@@ -65,8 +64,6 @@ impl CacheDb {
         Ok(Self { conn: Mutex::new(conn) })
     }
 
-    // ---- cache file tracking ----
-
     pub fn mark_cached(
         &self,
         rel_path: &Path,
@@ -102,7 +99,6 @@ impl CacheDb {
         tracing::info!(event = crate::telemetry::EVENT_DB_HIT, path = %rel_path.display(), "db: mark_hit {}", rel_path.display());
     }
 
-    /// Remove a file's DB entry (called when evicting from cache).
     pub fn remove(&self, rel_path: &Path, mount_id: &str) {
         let key = rel_path.to_string_lossy();
         let conn = self.conn.lock().unwrap();
@@ -291,11 +287,12 @@ impl CacheDb {
         .collect()
     }
 
-    /// Delete all deferred events (called when the caching window opens and
-    /// events are flushed to the action engine / predictor).
-    pub fn clear_deferred(&self) {
+    pub fn remove_deferred(&self, key: &Path) {
         let conn = self.conn.lock().unwrap();
-        let _ = conn.execute("DELETE FROM deferred_events", []);
+        let _ = conn.execute(
+            "DELETE FROM deferred_events WHERE key = ?1",
+            params![key.to_string_lossy().as_ref()],
+        );
     }
 
     /// Open the database in read-only mode for use by the watch client.
@@ -372,10 +369,7 @@ impl CacheDb {
         .collect()
     }
 
-    // ---- cache invalidation: fingerprint queries ----
-
-    /// Fetch the stored fingerprint for a single file (one-row DB lookup).
-    /// Returns `None` if the file is not tracked.
+    /// Fetch the stored fingerprint for a single file. Returns `None` if the file is not tracked.
     pub fn fingerprint_row(&self, rel_path: &Path, mount_id: &str) -> Option<Fingerprint> {
         let key = rel_path.to_string_lossy();
         let conn = self.conn.lock().unwrap();
@@ -468,8 +462,6 @@ impl CacheDb {
         );
     }
 }
-
-// ---- private helpers ----
 
 fn now_secs() -> u64 {
     SystemTime::now()

@@ -10,12 +10,12 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 
 use fscache::cache::io::{CacheIO, CacheIoConfig};
-use fscache::engine::action::{buffer_event, show_root, AccessEvent, ActionEngine};
+use fscache::engine::action::{AccessEvent, ActionEngine};
 use fscache::backing_store::BackingStore;
 use fscache::cache::manager::CacheManager;
 use fscache::cache::db::CacheDb;
 use fscache::preset::CachePreset;
-use fscache::prediction_utils::{parse_season_dir, parse_season_episode};
+use fscache::prediction_utils::{parse_season_dir, parse_season_episode, show_root};
 use fscache::presets::plex_episode_prediction::PlexEpisodePrediction;
 use fscache::engine::scheduler::Scheduler;
 
@@ -86,22 +86,21 @@ fn make_engine(
     backing_store: Arc<BackingStore>,
     max_cache_pull_bytes: u64,
 ) -> ActionEngine {
+    let scheduler = Scheduler::new("00:00", "23:59").unwrap();
     let cache_io = CacheIO::spawn(
-        CacheIoConfig { max_concurrent_copies: 1, copy_queue_depth: 32, eviction_interval_secs: 0 },
+        CacheIoConfig { max_concurrent_copies: 1, eviction_interval_secs: 0, deferred_ttl_minutes: 0 },
         Arc::clone(&cache),
         Arc::clone(&backing_store),
+        scheduler,
     );
     let preset = Arc::new(PlexEpisodePrediction::new(lookahead, vec![], false));
-    let scheduler = Scheduler::new("00:00", "23:59").unwrap();
     ActionEngine::new(
         access_rx,
         cache_io,
         cache,
         Some(preset as Arc<dyn CachePreset>),
-        scheduler,
         backing_store,
         max_cache_pull_bytes,
-        0,
         0,
         0,
     )
@@ -442,7 +441,7 @@ async fn predictor_budget_includes_existing_cache() {
     assert!(!cache_ep_dir.join("Show.S01E05.mkv").exists(), "E05 must NOT be cached");
 }
 
-// ---- deferred event tests ----
+// ---- deferred event / DB tests ----
 
 #[test]
 fn show_root_uses_parent_dir() {
@@ -452,55 +451,6 @@ fn show_root_uses_parent_dir() {
                std::path::PathBuf::from("tv/Show"));
     assert_eq!(show_root(std::path::Path::new("file.mkv")),
                std::path::PathBuf::from(""));
-}
-
-#[test]
-fn buffer_event_keeps_most_advanced() {
-    use std::collections::HashMap;
-    let mut deferred = HashMap::new();
-
-    buffer_event(&mut deferred, AccessEvent::miss(PathBuf::from("Show/Show.S01E01.mkv")));
-    buffer_event(&mut deferred, AccessEvent::miss(PathBuf::from("Show/Show.S01E04.mkv")));
-    buffer_event(&mut deferred, AccessEvent::miss(PathBuf::from("Show/Show.S01E02.mkv")));
-
-    assert_eq!(deferred.len(), 1);
-    let kept = deferred.values().next().unwrap();
-    assert_eq!(kept.relative_path, PathBuf::from("Show/Show.S01E04.mkv"));
-}
-
-#[test]
-fn buffer_event_different_dirs_are_separate() {
-    use std::collections::HashMap;
-    let mut deferred = HashMap::new();
-
-    buffer_event(&mut deferred, AccessEvent::miss(PathBuf::from("ShowA/Show.S01E01.mkv")));
-    buffer_event(&mut deferred, AccessEvent::miss(PathBuf::from("ShowB/Show.S01E01.mkv")));
-
-    assert_eq!(deferred.len(), 2);
-}
-
-#[test]
-fn buffer_event_cross_season_keeps_higher() {
-    use std::collections::HashMap;
-    let mut deferred = HashMap::new();
-
-    buffer_event(&mut deferred, AccessEvent::miss(PathBuf::from("Show/Show.S01E08.mkv")));
-    buffer_event(&mut deferred, AccessEvent::miss(PathBuf::from("Show/Show.S02E01.mkv")));
-
-    assert_eq!(deferred.len(), 1);
-    let kept = deferred.values().next().unwrap();
-    assert_eq!(kept.relative_path, PathBuf::from("Show/Show.S02E01.mkv"));
-}
-
-#[test]
-fn buffer_event_non_episode_keyed_by_full_path() {
-    use std::collections::HashMap;
-    let mut deferred = HashMap::new();
-
-    buffer_event(&mut deferred, AccessEvent::miss(PathBuf::from("movies/Movie.mkv")));
-    buffer_event(&mut deferred, AccessEvent::miss(PathBuf::from("movies/Other.mkv")));
-
-    assert_eq!(deferred.len(), 2);
 }
 
 #[test]

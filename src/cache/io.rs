@@ -1,75 +1,118 @@
-use std::path::PathBuf;
+use std::collections::{HashSet, VecDeque};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 
 use crate::backing_store::BackingStore;
 use crate::cache::manager::CacheManager;
+use crate::engine::scheduler::Scheduler;
 use crate::telemetry;
-
-/// A job submitted to CacheIO to copy a file from the backing store into the cache.
-pub struct CacheJob {
-    pub rel_path: PathBuf,
-    pub cache_dest: PathBuf,
-    /// Notifies the ActionEngine when this job completes or is skipped, so it can
-    /// remove the path from its in-flight dedupe set.
-    pub done_tx: mpsc::UnboundedSender<PathBuf>,
-}
 
 pub struct CacheIoConfig {
     /// Maximum number of backing→cache copies running concurrently.
-    /// Default 1 preserves the single-copy behaviour from before this feature.
     pub max_concurrent_copies: usize,
-    /// Depth of the bounded copy-submission channel. Callers block when full.
-    pub copy_queue_depth: usize,
     /// How often the autonomous eviction worker runs (seconds). 0 disables it.
     pub eviction_interval_secs: u64,
+    /// Discard deferred jobs older than this many minutes on startup and during TTL sweep.
+    pub deferred_ttl_minutes: u64,
+}
+
+/// Single source of truth for all pending and in-flight cache work.
+///
+/// The `queue` is a FIFO of paths waiting for the caching window to open.
+/// `known` tracks every path that CacheIO has seen — queued or in flight —
+/// to prevent duplicate submissions. A path is removed from `known` only when
+/// its copy worker finishes (success or failure), so dedup is airtight across
+/// the queue-to-in-flight transition.
+struct PipelineState {
+    /// FIFO of `(rel_path, enqueue_timestamp_secs)`.
+    queue: VecDeque<(PathBuf, u64)>,
+    /// All paths currently queued OR in flight. Drives submit-time dedup.
+    known: HashSet<PathBuf>,
+}
+
+impl PipelineState {
+    fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            known: HashSet::new(),
+        }
+    }
 }
 
 /// Owner of all cache filesystem I/O: the copy pipeline and the eviction pipeline.
 ///
-/// Both pipelines run on independent tokio tasks — eviction is never gated by copy
-/// traffic. Copy workers can also trigger on-demand LRU eviction when they need to
-/// make room for an incoming file (serialised internally so workers don't race).
+/// Cloning produces a second handle backed by the same internal state — safe to
+/// share across tasks.
+///
+/// Every path submitted via `submit_cache` is enqueued unconditionally (dedup
+/// aside). The caching window only controls whether the dispatcher is allowed to
+/// drain the queue. There is exactly one code path into the copy pipeline.
 #[derive(Clone)]
 pub struct CacheIO {
-    cache_tx: mpsc::Sender<CacheJob>,
-    /// Serialises on-demand force-eviction from concurrent copy workers.
-    evict_lock: Arc<Mutex<()>>,
-    cache: Arc<CacheManager>,
+    cache:                Arc<CacheManager>,
+    backing_store:        Arc<BackingStore>,
+    scheduler:            Scheduler,
+    state:                Arc<Mutex<PipelineState>>,
+    notify:               Arc<Notify>,
+    semaphore:            Arc<Semaphore>,
+    evict_lock:           Arc<Mutex<()>>,
+    deferred_ttl_minutes: u64,
 }
 
 impl CacheIO {
-    /// Spawns the copy dispatcher and eviction worker tasks, then returns a handle.
+    /// Spawn the dispatcher and eviction worker tasks, then return a shareable handle.
     pub fn spawn(
         cfg: CacheIoConfig,
         cache: Arc<CacheManager>,
         backing_store: Arc<BackingStore>,
+        scheduler: Scheduler,
     ) -> Self {
-        let (cache_tx, cache_rx) = mpsc::channel::<CacheJob>(cfg.copy_queue_depth);
-        let evict_lock = Arc::new(Mutex::new(()));
+        let db = cache.cache_db();
+
+        // Seed the in-memory queue from the persisted DB table, discarding stale entries.
+        let mut initial = PipelineState::new();
+        let loaded = db.load_deferred(cfg.deferred_ttl_minutes);
+        if !loaded.is_empty() {
+            tracing::info!("cache_io: loaded {} deferred job(s) from DB", loaded.len());
+        }
+        for (_, path, ts) in loaded {
+            if initial.known.insert(path.clone()) {
+                initial.queue.push_back((path, ts));
+            }
+        }
+        let initial_count = initial.queue.len() as u64;
+        if initial_count > 0 {
+            tracing::debug!(
+                event = telemetry::EVENT_DEFERRED_CHANGED,
+                count = initial_count,
+                "cache_io: {} deferred job(s) restored from DB",
+                initial_count,
+            );
+        }
 
         let handle = CacheIO {
-            cache_tx,
-            evict_lock: Arc::clone(&evict_lock),
             cache: Arc::clone(&cache),
+            backing_store: Arc::clone(&backing_store),
+            scheduler,
+            state: Arc::new(Mutex::new(initial)),
+            notify: Arc::new(Notify::new()),
+            semaphore: Arc::new(Semaphore::new(cfg.max_concurrent_copies)),
+            evict_lock: Arc::new(Mutex::new(())),
+            deferred_ttl_minutes: cfg.deferred_ttl_minutes,
         };
 
-        let semaphore = Arc::new(Semaphore::new(cfg.max_concurrent_copies));
+        // Dispatcher: drains the queue whenever the caching window is open.
+        tokio::spawn(dispatcher(handle.clone()));
 
-        let dispatcher_cache = Arc::clone(&cache);
-        let dispatcher_bs = Arc::clone(&backing_store);
-        let dispatcher_evict_lock = Arc::clone(&evict_lock);
-        tokio::spawn(async move {
-            cache_dispatcher(
-                cache_rx,
-                dispatcher_cache,
-                dispatcher_bs,
-                semaphore,
-                dispatcher_evict_lock,
-            )
-            .await;
-        });
+        // If we rehydrated entries from the DB, wake the dispatcher immediately
+        // rather than waiting for the first submit_cache call or the 10-second tick.
+        if initial_count > 0 {
+            handle.notify.notify_one();
+        }
 
         if cfg.eviction_interval_secs > 0 {
             let evict_cache = Arc::clone(&cache);
@@ -82,93 +125,185 @@ impl CacheIO {
         handle
     }
 
-    /// Submit a file for caching. Returns as soon as the job is queued.
-    /// Backpressure: awaits if the copy queue is full (`copy_queue_depth` reached).
-    pub async fn submit_cache(&self, job: CacheJob) {
-        let _ = self.cache_tx.send(job).await;
+    /// Submit a path for caching. This is the single entrypoint for all cache requests.
+    ///
+    /// The path is pushed onto the queue unconditionally (subject to dedup and
+    /// already-cached checks). The caching window check happens in the dispatcher —
+    /// not here. There is no separate "deferred vs. immediate" branch.
+    pub async fn submit_cache(&self, rel_path: PathBuf) {
+        // Cheap check before taking the lock — avoids contention on cache hits.
+        if self.cache.is_cached(&rel_path) {
+            tracing::debug!("cache_io: {} already cached, skipping", rel_path.display());
+            return;
+        }
+
+        let queue_len = {
+            let mut st = self.state.lock().await;
+            if !st.known.insert(rel_path.clone()) {
+                tracing::debug!(
+                    "cache_io: {} already queued or in flight, skipping",
+                    rel_path.display()
+                );
+                return;
+            }
+            let now = now_secs();
+            st.queue.push_back((rel_path.clone(), now));
+            let len = st.queue.len() as u64;
+
+            // Persist while holding the lock so the DB row and the in-memory
+            // entry are always in sync.
+            self.cache.cache_db().save_deferred(&rel_path, &rel_path, now);
+            len
+        };
+
+        tracing::info!(
+            event = telemetry::EVENT_COPY_QUEUED,
+            path = %rel_path.display(),
+            "cache_io: queued {} for caching ({} pending)",
+            rel_path.display(),
+            queue_len,
+        );
+        tracing::debug!(
+            event = telemetry::EVENT_DEFERRED_CHANGED,
+            count = queue_len,
+            "cache_io: queue depth {}",
+            queue_len,
+        );
+
+        self.notify.notify_one();
+    }
+
+    /// Remove TTL-expired entries from the front of the queue.
+    ///
+    /// The queue is FIFO-ordered by enqueue time, so all stale entries will be
+    /// at the front. This is called from the dispatcher on every tick.
+    async fn expire_stale(&self) {
+        if self.deferred_ttl_minutes == 0 {
+            return;
+        }
+        let cutoff = now_secs().saturating_sub(self.deferred_ttl_minutes * 60);
+        let removed: Vec<PathBuf> = {
+            let mut st = self.state.lock().await;
+            let mut expired = Vec::new();
+            while let Some((_, ts)) = st.queue.front() {
+                if *ts >= cutoff {
+                    break;
+                }
+                let (path, _) = st.queue.pop_front().unwrap();
+                st.known.remove(&path);
+                expired.push(path);
+            }
+            expired
+        };
+
+        if !removed.is_empty() {
+            let db = self.cache.cache_db();
+            for path in &removed {
+                tracing::debug!("cache_io: deferred job expired (TTL): {}", path.display());
+                db.remove_deferred(path);
+            }
+            let count = self.state.lock().await.queue.len() as u64;
+            tracing::debug!(
+                event = telemetry::EVENT_DEFERRED_CHANGED,
+                count,
+                "cache_io: {} job(s) after TTL expiry",
+                count,
+            );
+        }
     }
 }
 
-// ---- internal tasks -------------------------------------------------------
+/// The dispatcher is the only place the caching window is consulted.
+/// It wakes on every `submit_cache` call and every 10 s tick (to re-check the
+/// window when no submissions are arriving), draining the queue whenever allowed.
+async fn dispatcher(io: CacheIO) {
+    loop {
+        tokio::select! {
+            _ = io.notify.notified() => {}
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+        }
 
-async fn cache_dispatcher(
-    mut rx: mpsc::Receiver<CacheJob>,
-    cache: Arc<CacheManager>,
-    backing_store: Arc<BackingStore>,
-    semaphore: Arc<Semaphore>,
-    evict_lock: Arc<Mutex<()>>,
-) {
-    while let Some(job) = rx.recv().await {
-        // Acquire a concurrency slot before spawning. When max_concurrent_copies == 1
-        // this is equivalent to waiting for the previous copy to finish.
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore closed");
+        let allowed = io.scheduler.is_caching_allowed();
+        tracing::debug!(
+            event = telemetry::EVENT_CACHING_WINDOW,
+            allowed,
+            "cache_io: window check",
+        );
 
-        let cache = Arc::clone(&cache);
-        let backing_store = Arc::clone(&backing_store);
-        let evict_lock = Arc::clone(&evict_lock);
+        // Always run TTL sweep, even when the window is closed.
+        io.expire_stale().await;
 
-        tokio::spawn(async move {
-            copy_worker(job, cache, backing_store, evict_lock).await;
-            drop(permit); // release slot when the worker finishes
-        });
+        if !allowed {
+            continue;
+        }
+
+        // Drain the queue. Acquiring the semaphore permit before spawning
+        // provides backpressure: when all workers are busy the dispatcher
+        // blocks here (rather than pre-spawning unbounded tasks), so the
+        // queue reflects real backlog instead of just "in-flight + queued".
+        loop {
+            let next = { io.state.lock().await.queue.pop_front() };
+            let Some((rel_path, _)) = next else { break };
+
+            let permit = io.semaphore.clone().acquire_owned().await
+                .expect("semaphore closed");
+
+            let io2 = io.clone();
+            tokio::spawn(async move {
+                copy_worker(io2, rel_path).await;
+                drop(permit);
+            });
+        }
     }
 }
 
-async fn copy_worker(
-    job: CacheJob,
-    cache: Arc<CacheManager>,
-    backing_store: Arc<BackingStore>,
-    evict_lock: Arc<Mutex<()>>,
-) {
-    let rel = job.rel_path.clone();
-
-    if cache.is_cached(&rel) {
-        tracing::debug!("cache_io: {} already cached, skipping", rel.display());
-        let _ = job.done_tx.send(rel);
+async fn copy_worker(io: CacheIO, rel_path: PathBuf) {
+    if io.cache.is_cached(&rel_path) {
+        tracing::debug!("cache_io: {} already cached, skipping", rel_path.display());
+        finish_known(&io, &rel_path).await;
         return;
     }
 
-    // On-demand eviction: if there is not enough space, evict LRU files to fit
-    // this one. The evict_lock serialises concurrent workers so they don't all
-    // compute the same deletion set and over-evict.
-    if !cache.has_free_space() {
-        let size_bytes = backing_store.file_size(&rel).unwrap_or(0);
-        let _guard = evict_lock.lock().await;
-        // Re-check inside the lock — another worker may have already freed space.
-        if !cache.has_free_space() {
-            let freed = cache.evict_to_fit(size_bytes);
+    // On-demand eviction: make room if needed. The evict_lock serialises concurrent
+    // workers so they don't compute the same deletion set and over-evict.
+    if !io.cache.has_free_space() {
+        let size_bytes = io.backing_store.file_size(&rel_path).unwrap_or(0);
+        let _guard = io.evict_lock.lock().await;
+        if !io.cache.has_free_space() {
+            let freed = io.cache.evict_to_fit(size_bytes);
             tracing::info!(
                 "cache_io: evicted {:.1} MB on demand to fit {}",
                 freed as f64 / 1_048_576.0,
-                rel.display()
+                rel_path.display(),
             );
         }
     }
 
-    if !cache.has_free_space() {
+    if !io.cache.has_free_space() {
         tracing::warn!(
             event = telemetry::EVENT_COPY_FAILED,
-            path = %rel.display(),
-            "cache_io: insufficient free space after eviction, skipping {}", rel.display()
+            path = %rel_path.display(),
+            "cache_io: insufficient free space after eviction, skipping {}",
+            rel_path.display(),
         );
-        let _ = job.done_tx.send(rel);
+        finish_known(&io, &rel_path).await;
         return;
     }
 
-    let size_bytes = backing_store.file_size(&rel).unwrap_or(0);
+    let size_bytes = io.backing_store.file_size(&rel_path).unwrap_or(0);
+    let cache_dest = io.cache.cache_path(&rel_path);
+
     tracing::info!(
         event = telemetry::EVENT_COPY_STARTED,
-        path = %rel.display(),
+        path = %rel_path.display(),
         size_bytes,
-        "cache_io: caching {}", rel.display()
+        "cache_io: caching {}",
+        rel_path.display(),
     );
 
-    let dest = job.cache_dest.clone();
-    let bs = Arc::clone(&backing_store);
+    let bs = Arc::clone(&io.backing_store);
+    let rel = rel_path.clone();
+    let dest = cache_dest.clone();
     let result = tokio::task::spawn_blocking(move || {
         crate::engine::copier::copy_to_cache(&bs, &rel, &dest)
     })
@@ -176,39 +311,47 @@ async fn copy_worker(
 
     match result {
         Ok(Ok(())) => {
-            use std::os::unix::fs::MetadataExt;
-            let (size, mtime_secs, mtime_nsecs) = match std::fs::metadata(&job.cache_dest) {
+            let (size, mtime_secs, mtime_nsecs) = match std::fs::metadata(&cache_dest) {
                 Ok(m) => (m.len(), m.mtime(), m.mtime_nsec()),
                 Err(_) => (0, 0, 0),
             };
-            cache.mark_cached(&job.rel_path, size, mtime_secs, mtime_nsecs);
+            io.cache.mark_cached(&rel_path, size, mtime_secs, mtime_nsecs);
             tracing::info!(
                 event = telemetry::EVENT_COPY_COMPLETE,
-                path = %job.rel_path.display(),
-                "cache_io: cached {}", job.rel_path.display()
+                path = %rel_path.display(),
+                "cache_io: cached {}",
+                rel_path.display(),
             );
         }
         Ok(Err(e)) => {
             tracing::warn!(
                 event = telemetry::EVENT_COPY_FAILED,
-                path = %job.rel_path.display(),
-                "cache_io: copy failed {}: {e}", job.rel_path.display()
+                path = %rel_path.display(),
+                "cache_io: copy failed {}: {e}",
+                rel_path.display(),
             );
         }
         Err(e) => {
             tracing::warn!(
                 event = telemetry::EVENT_COPY_FAILED,
-                path = %job.rel_path.display(),
-                "cache_io: task panicked {}: {e}", job.rel_path.display()
+                path = %rel_path.display(),
+                "cache_io: task panicked {}: {e}",
+                rel_path.display(),
             );
         }
     }
 
-    let _ = job.done_tx.send(job.rel_path);
+    finish_known(&io, &rel_path).await;
+}
+
+/// Remove a path from `known` and delete its DB row. Called on copy completion.
+async fn finish_known(io: &CacheIO, rel_path: &Path) {
+    io.state.lock().await.known.remove(rel_path);
+    io.cache.cache_db().remove_deferred(rel_path);
 }
 
 async fn eviction_worker(cache: Arc<CacheManager>, interval_secs: u64) {
-    let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
     ticker.tick().await; // consume the immediate first tick
     loop {
         ticker.tick().await;
@@ -217,4 +360,11 @@ async fn eviction_worker(cache: Arc<CacheManager>, interval_secs: u64) {
             .await
             .ok();
     }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }

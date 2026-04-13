@@ -58,9 +58,6 @@ pub struct CacheConfig {
     /// Maximum number of concurrent backing→cache copies. Default 1 preserves pre-0.4 behavior.
     #[serde(default = "default_max_concurrent_copies")]
     pub max_concurrent_copies: usize,
-    /// Depth of the internal CacheIO copy queue. Default 64 matches the previous hardcode.
-    #[serde(default = "default_copy_queue_depth")]
-    pub copy_queue_depth: usize,
 }
 
 impl Default for CacheConfig {
@@ -72,10 +69,9 @@ impl Default for CacheConfig {
             passthrough_mode: false,
             max_cache_pull_per_mount_gb: 0.0,
             deferred_ttl_minutes: default_deferred_ttl_minutes(),
-            min_access_secs: 0,
+            min_access_secs: 2,
             min_file_size_mb: 0,
             max_concurrent_copies: default_max_concurrent_copies(),
-            copy_queue_depth: default_copy_queue_depth(),
         }
     }
 }
@@ -296,7 +292,6 @@ fn default_preset_name() -> String { "plex-episode-prediction".to_string() }
 fn default_lookahead() -> usize { 4 }
 fn default_plex_mode() -> String { "miss-only".to_string() }
 fn default_max_concurrent_copies() -> usize { 1 }
-fn default_copy_queue_depth() -> usize { 64 }
 fn default_deferred_ttl_minutes() -> u64 { 1440 }
 fn default_max_size_gb() -> f64 { 200.0 }
 fn default_expiry_hours() -> u64 { 72 }

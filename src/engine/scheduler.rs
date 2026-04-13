@@ -1,5 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Clone)]
 pub struct Scheduler {
     start: (u8, u8), // (hour, minute) 24h
     end: (u8, u8),

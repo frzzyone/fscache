@@ -61,8 +61,11 @@ check_on_maintenance = true
 passthrough_mode = false                 # If true, bypass cache entirely (debug/test mode)
 max_cache_pull_per_mount_gb = 0.0        # Per-mount lookahead prediction budget (0 = unlimited)
 deferred_ttl_minutes = 1440             # Discard saved deferred events older than this on startup (default 24h)
-min_access_secs = 0                      # Minimum seconds a file must stay open before prediction triggers (0 = immediate)
+min_access_secs = 2                      # Minimum seconds a file must stay open before prediction triggers. Filters transient Plex scanner/transcoder probes that open files briefly without streaming. Set to 0 only for tests or debugging.
 min_file_size_mb = 0                     # Skip files below this size in MB — filters metadata/subtitle noise (0 = no floor)
+max_concurrent_copies = 1               # Max parallel backing→cache copies. 1 = serial (default, safest).
+                                         # Bump to 2–8 on fast SSDs with a slow backing mount (SMB/NFS)
+                                         # to saturate read bandwidth during multi-episode prefills.
 
 [schedule]
 cache_window_start = "08:00"             # Allowed caching window start (HH:MM, 24h)

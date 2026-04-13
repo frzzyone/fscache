@@ -33,7 +33,6 @@ pub struct FuseHarness {
     /// The original source files live here — never touched by the FUSE fs.
     pub backing: TempDir,
     pub mount: TempDir,
-    /// Optional separate cache dir for cache overlay tests.
     pub cache: Option<TempDir>,
     /// Exposed for tests that need to call sweep_stale(), mark_cached(), etc. directly.
     pub cache_mgr: Option<Arc<CacheManager>>,
@@ -105,8 +104,6 @@ impl FuseHarness {
         let cache_dir = TempDir::new()?;
 
         let mut fs = FsCache::new(backing.path())?;
-        // Wire backing_store into CacheManager — matches main.rs production setup.
-        // This is what makes is_stale() able to stat the backing file.
         let backing_store = Arc::clone(&fs.backing_store);
         let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db"))?);
         let cache_mgr = Arc::new(CacheManager::new(
@@ -216,24 +213,23 @@ impl FuseHarness {
         let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
         fs.access_tx = Some(access_tx);
 
+        let scheduler = Scheduler::new("00:00", "23:59").unwrap();
         let cache_io = CacheIO::spawn(
             CacheIoConfig {
                 max_concurrent_copies: 1,
-                copy_queue_depth: 64,
                 eviction_interval_secs,
+                deferred_ttl_minutes: 0,
             },
             Arc::clone(&cache_mgr),
             Arc::clone(&backing_store),
+            scheduler,
         );
-        let scheduler = Scheduler::new("00:00", "23:59").unwrap();
         let engine = ActionEngine::new(
             access_rx,
             cache_io,
             Arc::clone(&cache_mgr),
             Some(preset),
-            scheduler,
             Arc::clone(&backing_store),
-            0,
             0,
             0,
             0,
@@ -313,20 +309,19 @@ impl OvermountHarness {
         let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
         fs.access_tx = Some(access_tx);
 
+        let scheduler = Scheduler::new("00:00", "23:59").unwrap();
         let cache_io = CacheIO::spawn(
-            CacheIoConfig { max_concurrent_copies: 1, copy_queue_depth: 64, eviction_interval_secs: 0 },
+            CacheIoConfig { max_concurrent_copies: 1, eviction_interval_secs: 0, deferred_ttl_minutes: 0 },
             Arc::clone(&cache_mgr),
             Arc::clone(&backing_store),
+            scheduler,
         );
-        let scheduler = Scheduler::new("00:00", "23:59").unwrap();
         let engine = ActionEngine::new(
             access_rx,
             cache_io,
             Arc::clone(&cache_mgr),
             Some(preset as Arc<dyn CachePreset>),
-            scheduler,
             Arc::clone(&backing_store),
-            0,
             0,
             0,
             0,
@@ -440,20 +435,19 @@ impl MultiFuseHarness {
             let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
             fs.access_tx = Some(access_tx);
 
+            let scheduler = Scheduler::new("00:00", "23:59").unwrap();
             let cache_io = CacheIO::spawn(
-                CacheIoConfig { max_concurrent_copies: 1, copy_queue_depth: 64, eviction_interval_secs: 0 },
+                CacheIoConfig { max_concurrent_copies: 1, eviction_interval_secs: 0, deferred_ttl_minutes: 0 },
                 Arc::clone(&cache_mgr),
                 Arc::clone(&backing_store),
+                scheduler,
             );
-            let scheduler = Scheduler::new("00:00", "23:59").unwrap();
             let engine = ActionEngine::new(
                 access_rx,
                 cache_io,
                 Arc::clone(&cache_mgr),
                 Some(preset as Arc<dyn CachePreset>),
-                scheduler,
                 Arc::clone(&backing_store),
-                0,
                 0,
                 0,
                 0,
@@ -503,7 +497,6 @@ pub fn read_mount_file(harness: &FuseHarness, rel: &str) -> Vec<u8> {
     std::fs::read(harness.mount_path().join(rel)).unwrap()
 }
 
-/// SHA-256 hash of a file's contents.
 pub fn file_hash(path: &Path) -> String {
     use sha2::{Digest, Sha256};
     let data = std::fs::read(path).unwrap();
