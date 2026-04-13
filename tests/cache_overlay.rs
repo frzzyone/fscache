@@ -454,3 +454,63 @@ fn maintenance_evict_if_needed_runs_without_copies() {
 
     assert!(!expired.exists(), "evict_if_needed should remove expired file without copier");
 }
+
+/// evict_to_fit: given N bytes of incoming content, evicts the minimum LRU candidates
+/// needed so the cache can hold the new file within its budget.
+///
+/// Setup: budget = 1200 bytes, 3 files of 400 bytes each (total = 1200 = exactly at limit).
+/// A new file of 500 bytes needs to land → target = 1200 - 500 = 700 bytes remaining.
+/// Need to free 500 bytes: evict oldest (400), freed=400 < 500; evict next (400), freed=800 ≥ 500.
+/// Result: 2 LRU files evicted, 1 (newest) remains.
+#[test]
+fn evict_to_fit_frees_lru_files_to_fit_incoming() {
+    use fscache::cache::manager::CacheManager;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    let cache_dir = TempDir::new().unwrap();
+
+    // Three files — 400 bytes each.
+    let file1 = cache_dir.path().join("a.mkv");
+    let file2 = cache_dir.path().join("b.mkv");
+    let file3 = cache_dir.path().join("c.mkv");
+    std::fs::write(&file1, vec![1u8; 400]).unwrap();
+    std::fs::write(&file2, vec![2u8; 400]).unwrap();
+    std::fs::write(&file3, vec![3u8; 400]).unwrap();
+
+    // Budget = 1200 bytes exactly — all three files fit, nothing spare.
+    let budget_gb = 1200.0_f64 / 1_073_741_824.0;
+    let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
+    let mgr = CacheManager::new(
+        cache_dir.path().to_path_buf(),
+        Arc::clone(&db),
+        cache_dir.path().to_path_buf(),
+        budget_gb,
+        9999, // effectively no TTL expiry
+        0.0,
+        None,
+        &Default::default(),
+    );
+
+    mgr.mark_cached(Path::new("a.mkv"), 400, 0, 0);
+    mgr.mark_cached(Path::new("b.mkv"), 400, 0, 0);
+    mgr.mark_cached(Path::new("c.mkv"), 400, 0, 0);
+
+    // Make LRU order explicit: a.mkv is oldest, c.mkv is newest.
+    let mount_id = cache_dir.path().to_string_lossy().into_owned();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    db.set_last_hit_at_for_test(Path::new("a.mkv"), &mount_id, now - 3600);
+    db.set_last_hit_at_for_test(Path::new("b.mkv"), &mount_id, now - 1800);
+    db.set_last_hit_at_for_test(Path::new("c.mkv"), &mount_id, now);
+
+    // Ask to make room for a 500-byte incoming file.
+    let freed = mgr.evict_to_fit(500);
+
+    assert!(freed >= 500, "evict_to_fit should have freed at least 500 bytes, freed {freed}");
+    assert!(!file1.exists(), "a.mkv (oldest) should be evicted");
+    assert!(!file2.exists(), "b.mkv (second oldest) should be evicted");
+    assert!(file3.exists(), "c.mkv (newest) should survive");
+}

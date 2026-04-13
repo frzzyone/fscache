@@ -11,7 +11,7 @@
 ///
 /// These tests exercise the full pipeline:
 ///   FUSE open() → AccessEvent → ActionEngine → PlexEpisodePrediction::on_miss()
-///   → find_next_episodes() → CopyRequest → copier → mark_cached()
+///   → find_next_episodes() → CacheIO::submit_cache() → copy_worker → mark_cached()
 ///   → subsequent reads served from SSD.
 use crate::common::{write_backing_file, FuseHarness, OvermountHarness};
 use std::time::Duration;

@@ -303,6 +303,39 @@ impl CacheManager {
         }
     }
 
+    /// Evict LRU candidates from this mount until the cache would fit `pending_bytes`
+    /// of new content within `max_size_bytes`. Returns the number of bytes reclaimed.
+    /// Called by CacheIO copy workers that need to make room before copying a file.
+    pub fn evict_to_fit(&self, pending_bytes: u64) -> u64 {
+        let global_total = self.db.total_cached_bytes_global();
+        let target = self.max_size_bytes.saturating_sub(pending_bytes);
+        if global_total <= target {
+            return 0;
+        }
+        let need_to_free = global_total - target;
+        let mut freed = 0u64;
+
+        for (rel_path, size) in self.db.eviction_candidates(&self.mount_id, usize::MAX) {
+            if freed >= need_to_free {
+                break;
+            }
+            let abs_path = self.cache_dir.join(&rel_path);
+            if let Err(e) = std::fs::remove_file(&abs_path) {
+                tracing::warn!("evict_to_fit: failed to delete {}: {e}", abs_path.display());
+            } else {
+                tracing::info!(
+                    event = crate::telemetry::EVENT_EVICTION,
+                    path = %abs_path.display(),
+                    reason = "size_limit",
+                    "evict_to_fit: {}", abs_path.display()
+                );
+                self.db.remove(&rel_path, &self.mount_id);
+                freed += size;
+            }
+        }
+        freed
+    }
+
     pub fn has_free_space(&self) -> bool {
         free_space_bytes(&self.cache_dir)
             .map(|free| free >= self.min_free_bytes)

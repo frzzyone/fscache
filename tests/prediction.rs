@@ -9,9 +9,8 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
-use fscache::engine::action::{
-    buffer_event, run_copier_task, show_root, AccessEvent, ActionEngine, CopyRequest,
-};
+use fscache::cache::io::{CacheIO, CacheIoConfig};
+use fscache::engine::action::{buffer_event, show_root, AccessEvent, ActionEngine};
 use fscache::backing_store::BackingStore;
 use fscache::cache::manager::CacheManager;
 use fscache::cache::db::CacheDb;
@@ -82,17 +81,21 @@ fn make_backing_store(path: &std::path::Path) -> std::sync::Arc<BackingStore> {
 
 fn make_engine(
     access_rx: mpsc::UnboundedReceiver<AccessEvent>,
-    copy_tx: mpsc::Sender<CopyRequest>,
     cache: Arc<CacheManager>,
     lookahead: usize,
     backing_store: Arc<BackingStore>,
     max_cache_pull_bytes: u64,
 ) -> ActionEngine {
+    let cache_io = CacheIO::spawn(
+        CacheIoConfig { max_concurrent_copies: 1, copy_queue_depth: 32, eviction_interval_secs: 0 },
+        Arc::clone(&cache),
+        Arc::clone(&backing_store),
+    );
     let preset = Arc::new(PlexEpisodePrediction::new(lookahead, vec![], false));
     let scheduler = Scheduler::new("00:00", "23:59").unwrap();
     ActionEngine::new(
         access_rx,
-        copy_tx,
+        cache_io,
         cache,
         Some(preset as Arc<dyn CachePreset>),
         scheduler,
@@ -135,11 +138,9 @@ async fn predictor_caches_next_episodes_via_regex() {
     ));
 
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
-    let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(32);
 
-    let engine = make_engine(access_rx, copy_tx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0);
+    let engine = make_engine(access_rx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0);
     tokio::spawn(engine.run());
-    tokio::spawn(run_copier_task(Arc::clone(&backing_store), copy_rx, Arc::clone(&cache)));
 
     access_tx
         .send(AccessEvent::miss(PathBuf::from("tv/Show/Show.S01E01.mkv")))
@@ -189,10 +190,8 @@ async fn predictor_skips_already_cached() {
         &Default::default(),
     ));
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
-    let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(32);
-    let engine = make_engine(access_rx, copy_tx, Arc::clone(&cache), 2, Arc::clone(&backing_store), 0);
+    let engine = make_engine(access_rx, Arc::clone(&cache), 2, Arc::clone(&backing_store), 0);
     tokio::spawn(engine.run());
-    tokio::spawn(run_copier_task(Arc::clone(&backing_store), copy_rx, Arc::clone(&cache)));
 
     access_tx
         .send(AccessEvent::miss(PathBuf::from("tv/Show/Show.S01E01.mkv")))
@@ -250,10 +249,8 @@ async fn regex_crosses_season_boundary_structured_layout() {
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
     let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default()));
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
-    let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(32);
-    let engine = make_engine(access_rx, copy_tx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0);
+    let engine = make_engine(access_rx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0);
     tokio::spawn(engine.run());
-    tokio::spawn(run_copier_task(Arc::clone(&backing_store), copy_rx, Arc::clone(&cache)));
 
     access_tx.send(AccessEvent::miss(PathBuf::from("Show/Season 1/Show.S01E03.mkv"))).unwrap();
 
@@ -286,10 +283,8 @@ async fn regex_crosses_season_boundary_flat_layout() {
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
     let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default()));
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
-    let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(32);
-    let engine = make_engine(access_rx, copy_tx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0);
+    let engine = make_engine(access_rx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0);
     tokio::spawn(engine.run());
-    tokio::spawn(run_copier_task(Arc::clone(&backing_store), copy_rx, Arc::clone(&cache)));
 
     access_tx.send(AccessEvent::miss(PathBuf::from("Show/Show.S01E03.mkv"))).unwrap();
 
@@ -344,10 +339,8 @@ async fn predictor_budget_zero_means_disabled() {
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
     let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default()));
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
-    let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(32);
-    let engine = make_engine(access_rx, copy_tx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0);
+    let engine = make_engine(access_rx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0);
     tokio::spawn(engine.run());
-    tokio::spawn(run_copier_task(Arc::clone(&backing_store), copy_rx, Arc::clone(&cache)));
 
     access_tx.send(AccessEvent::miss(PathBuf::from("tv/Show/Show.S01E01.mkv"))).unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -373,10 +366,8 @@ async fn predictor_respects_max_cache_pull_budget() {
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
     let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default()));
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
-    let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(32);
-    let engine = make_engine(access_rx, copy_tx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 250);
+    let engine = make_engine(access_rx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 250);
     tokio::spawn(engine.run());
-    tokio::spawn(run_copier_task(Arc::clone(&backing_store), copy_rx, Arc::clone(&cache)));
 
     access_tx.send(AccessEvent::miss(PathBuf::from("tv/Show/Show.S01E01.mkv"))).unwrap();
     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -403,10 +394,8 @@ async fn predictor_first_candidate_always_queued() {
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
     let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default()));
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
-    let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(32);
-    let engine = make_engine(access_rx, copy_tx, Arc::clone(&cache), 2, Arc::clone(&backing_store), 50);
+    let engine = make_engine(access_rx, Arc::clone(&cache), 2, Arc::clone(&backing_store), 50);
     tokio::spawn(engine.run());
-    tokio::spawn(run_copier_task(Arc::clone(&backing_store), copy_rx, Arc::clone(&cache)));
 
     access_tx.send(AccessEvent::miss(PathBuf::from("tv/Show/Show.S01E01.mkv"))).unwrap();
     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -437,10 +426,8 @@ async fn predictor_budget_includes_existing_cache() {
     // Reconcile the pre-placed E02 into the DB so total_cached_bytes() accounts for it.
     cache.startup_cleanup();
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
-    let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(32);
-    let engine = make_engine(access_rx, copy_tx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 250);
+    let engine = make_engine(access_rx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 250);
     tokio::spawn(engine.run());
-    tokio::spawn(run_copier_task(Arc::clone(&backing_store), copy_rx, Arc::clone(&cache)));
 
     access_tx.send(AccessEvent::miss(PathBuf::from("tv/Show/Show.S01E02.mkv"))).unwrap();
     tokio::time::sleep(Duration::from_millis(600)).await;

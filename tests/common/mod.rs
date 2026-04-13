@@ -2,7 +2,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use fuser::{MountOption, SessionACL};
-use fscache::engine::action::{run_copier_task, AccessEvent, ActionEngine, CopyRequest};
+use fscache::cache::io::{CacheIO, CacheIoConfig};
+use fscache::engine::action::{AccessEvent, ActionEngine};
 use fscache::cache::db::CacheDb;
 use fscache::cache::manager::CacheManager;
 use fscache::config::InvalidationConfig;
@@ -174,6 +175,22 @@ impl FuseHarness {
     ///
     /// Must be called from inside `#[tokio::test]`.
     pub fn new_full_pipeline_with_preset(preset: Arc<dyn CachePreset>) -> anyhow::Result<Self> {
+        Self::new_full_pipeline_with_config(preset, 1.0, 72, 0)
+    }
+
+    /// Full pipeline with explicit cache budget, expiry, and eviction-worker cadence.
+    ///
+    /// Use `eviction_interval_secs > 0` when a test needs the autonomous eviction
+    /// worker to fire (e.g. LRU trim or TTL expiry tests).  Use 0 to disable it and
+    /// call `cache_mgr().evict_if_needed()` directly for synchronous control.
+    ///
+    /// Must be called from inside `#[tokio::test]`.
+    pub fn new_full_pipeline_with_config(
+        preset: Arc<dyn CachePreset>,
+        max_size_gb: f64,
+        expiry_hours: u64,
+        eviction_interval_secs: u64,
+    ) -> anyhow::Result<Self> {
         let backing = TempDir::new()?;
         let mount = TempDir::new()?;
         let cache_dir = TempDir::new()?;
@@ -187,8 +204,8 @@ impl FuseHarness {
             cache_dir.path().to_path_buf(),
             db,
             cache_dir.path().to_path_buf(),
-            1.0,
-            72,
+            max_size_gb,
+            expiry_hours,
             0.0,
             None,
             &InvalidationConfig::default(),
@@ -197,13 +214,21 @@ impl FuseHarness {
         fs.cache = Some(Arc::clone(&cache_mgr));
 
         let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
-        let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(64);
         fs.access_tx = Some(access_tx);
 
+        let cache_io = CacheIO::spawn(
+            CacheIoConfig {
+                max_concurrent_copies: 1,
+                copy_queue_depth: 64,
+                eviction_interval_secs,
+            },
+            Arc::clone(&cache_mgr),
+            Arc::clone(&backing_store),
+        );
         let scheduler = Scheduler::new("00:00", "23:59").unwrap();
         let engine = ActionEngine::new(
             access_rx,
-            copy_tx,
+            cache_io,
             Arc::clone(&cache_mgr),
             Some(preset),
             scheduler,
@@ -214,7 +239,6 @@ impl FuseHarness {
             0,
         );
         tokio::spawn(engine.run());
-        tokio::spawn(run_copier_task(backing_store, copy_rx, Arc::clone(&cache_mgr)));
 
         let session = fuser::spawn_mount2(fs, mount.path(), &test_fuse_config())?;
 
@@ -287,13 +311,17 @@ impl OvermountHarness {
         fs.cache = Some(Arc::clone(&cache_mgr));
 
         let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
-        let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(64);
         fs.access_tx = Some(access_tx);
 
+        let cache_io = CacheIO::spawn(
+            CacheIoConfig { max_concurrent_copies: 1, copy_queue_depth: 64, eviction_interval_secs: 0 },
+            Arc::clone(&cache_mgr),
+            Arc::clone(&backing_store),
+        );
         let scheduler = Scheduler::new("00:00", "23:59").unwrap();
         let engine = ActionEngine::new(
             access_rx,
-            copy_tx,
+            cache_io,
             Arc::clone(&cache_mgr),
             Some(preset as Arc<dyn CachePreset>),
             scheduler,
@@ -304,7 +332,6 @@ impl OvermountHarness {
             0,
         );
         tokio::spawn(engine.run());
-        tokio::spawn(run_copier_task(backing_store, copy_rx, Arc::clone(&cache_mgr)));
 
         // AutoUnmount requires SessionACL::All (root) so cannot be used in tests.
         // Clean unmount is guaranteed by drop ordering: _session drops first.
@@ -411,13 +438,17 @@ impl MultiFuseHarness {
             fs.cache = Some(Arc::clone(&cache_mgr));
 
             let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
-            let (copy_tx, copy_rx) = mpsc::channel::<CopyRequest>(64);
             fs.access_tx = Some(access_tx);
 
+            let cache_io = CacheIO::spawn(
+                CacheIoConfig { max_concurrent_copies: 1, copy_queue_depth: 64, eviction_interval_secs: 0 },
+                Arc::clone(&cache_mgr),
+                Arc::clone(&backing_store),
+            );
             let scheduler = Scheduler::new("00:00", "23:59").unwrap();
             let engine = ActionEngine::new(
                 access_rx,
-                copy_tx,
+                cache_io,
                 Arc::clone(&cache_mgr),
                 Some(preset as Arc<dyn CachePreset>),
                 scheduler,
@@ -428,7 +459,6 @@ impl MultiFuseHarness {
                 0,
             );
             tokio::spawn(engine.run());
-            tokio::spawn(run_copier_task(backing_store, copy_rx, Arc::clone(&cache_mgr)));
 
             let session = fuser::spawn_mount2(fs, mount.path(), &test_fuse_config())?;
             mounts.push(FuseHarness { backing, mount, cache: None, cache_mgr: Some(Arc::clone(&cache_mgr)), _session: session });

@@ -2,7 +2,7 @@
 ///
 /// Each test exercises the full pipeline:
 ///   FUSE open() → AccessEvent → ActionEngine → Prefetch::on_miss()
-///   → CopyRequest → copier → mark_cached() → cache dir populated.
+///   → CacheIO::submit_cache() → copy_worker → mark_cached() → cache dir populated.
 ///
 /// Tests are split by mode so failures are immediately attributable:
 ///   - cache-hit-only   — only the accessed file lands in the cache

@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
 use crate::backing_store::BackingStore;
+use crate::cache::io::{CacheIO, CacheJob};
 use crate::cache::manager::CacheManager;
 use crate::cache::db::CacheDb;
 use crate::prediction_utils::parse_season_episode;
@@ -42,16 +43,9 @@ impl AccessEvent {
     }
 }
 
-pub struct CopyRequest {
-    pub rel_path: PathBuf,
-    pub cache_dest: PathBuf,
-    /// Sender to notify the action engine when this copy completes or fails.
-    pub done_tx: mpsc::UnboundedSender<PathBuf>,
-}
-
 pub struct ActionEngine {
     rx: mpsc::UnboundedReceiver<AccessEvent>,
-    copy_tx: mpsc::Sender<CopyRequest>,
+    cache_io: CacheIO,
     cache: Arc<CacheManager>,
     preset: Option<Arc<dyn CachePreset>>,
     scheduler: Scheduler,
@@ -77,7 +71,7 @@ struct PendingEntry {
 impl ActionEngine {
     pub fn new(
         rx: mpsc::UnboundedReceiver<AccessEvent>,
-        copy_tx: mpsc::Sender<CopyRequest>,
+        cache_io: CacheIO,
         cache: Arc<CacheManager>,
         preset: Option<Arc<dyn CachePreset>>,
         scheduler: Scheduler,
@@ -88,14 +82,14 @@ impl ActionEngine {
         min_file_size_mb: u64,
     ) -> Self {
         Self {
-            rx, copy_tx, cache, preset, scheduler, backing_store,
+            rx, cache_io, cache, preset, scheduler, backing_store,
             max_cache_pull_bytes, deferred_ttl_minutes, min_access_secs, min_file_size_mb,
         }
     }
 
     pub async fn run(self) {
         let ActionEngine {
-            mut rx, copy_tx, cache, preset, scheduler,
+            mut rx, cache_io, cache, preset, scheduler,
             backing_store, max_cache_pull_bytes, deferred_ttl_minutes,
             min_access_secs, min_file_size_mb,
         } = self;
@@ -324,7 +318,7 @@ impl ActionEngine {
                     let cache_dest = cache.cache_path(&rel);
                     tracing::info!(event = telemetry::EVENT_COPY_QUEUED, path = %rel.display(), "action_engine: queuing {} for caching", rel.display());
                     in_flight.insert(rel.clone());
-                    let _ = copy_tx.send(CopyRequest {
+                    cache_io.submit_cache(CacheJob {
                         rel_path: rel,
                         cache_dest,
                         done_tx: done_tx.clone(),
@@ -335,70 +329,13 @@ impl ActionEngine {
     }
 }
 
-pub async fn run_copier_task(
-    backing_store: Arc<BackingStore>,
-    mut rx: mpsc::Receiver<CopyRequest>,
-    cache: Arc<CacheManager>,
-) {
-    while let Some(req) = rx.recv().await {
-        if cache.is_cached(&req.rel_path) {
-            tracing::debug!("copier: {} already cached, skipping", req.rel_path.display());
-            let _ = req.done_tx.send(req.rel_path);
-            continue;
-        }
-
-        // Evict first so that the subsequent free-space check reflects reclaimed space.
-        cache.evict_if_needed();
-
-        if !cache.has_free_space() {
-            tracing::warn!(
-                "copier: insufficient free space after eviction, skipping {}",
-                req.rel_path.display()
-            );
-            let _ = req.done_tx.send(req.rel_path);
-            continue;
-        }
-
-        let rel = req.rel_path.clone();
-        let dest = req.cache_dest.clone();
-        let done_tx = req.done_tx.clone();
-        let size_bytes = backing_store.file_size(&rel).unwrap_or(0);
-        tracing::info!(event = telemetry::EVENT_COPY_STARTED, path = %rel.display(), size_bytes, "copier: caching {}", rel.display());
-
-        let bs = Arc::clone(&backing_store);
-        let result =
-            tokio::task::spawn_blocking(move || crate::engine::copier::copy_to_cache(&bs, &rel, &dest))
-                .await;
-
-        match result {
-            Ok(Ok(())) => {
-                use std::os::unix::fs::MetadataExt;
-                let (size, mtime_secs, mtime_nsecs) = match std::fs::metadata(&req.cache_dest) {
-                    Ok(m) => (m.len(), m.mtime(), m.mtime_nsec()),
-                    Err(_) => (0, 0, 0),
-                };
-                cache.mark_cached(&req.rel_path, size, mtime_secs, mtime_nsecs);
-                tracing::info!(event = telemetry::EVENT_COPY_COMPLETE, path = %req.rel_path.display(), "copier: cached {}", req.rel_path.display());
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(event = telemetry::EVENT_COPY_FAILED, path = %req.rel_path.display(), "copier: copy failed {}: {e}", req.rel_path.display());
-            }
-            Err(e) => {
-                tracing::warn!(event = telemetry::EVENT_COPY_FAILED, path = %req.rel_path.display(), "copier: task panicked {}: {e}", req.rel_path.display());
-            }
-        }
-        let _ = done_tx.send(req.rel_path);
-    }
-}
-
-/// Periodic maintenance task: runs a stale-file sweep (when enabled) and eviction
-/// on a fixed interval. Fixes the lazy-eviction gap where `evict_if_needed` was only
-/// called from the copier task and never ran when the copy queue was idle.
+/// Periodic maintenance task: runs a stale-file sweep on a fixed interval.
+/// Eviction is now handled independently by the CacheIO eviction worker.
 ///
-/// Spawned once per mount. Returns immediately if `poll_interval_secs == 0`.
+/// Spawned once per mount when `poll_interval_secs > 0` and
+/// `invalidation.check_on_maintenance` is true.
 pub async fn run_maintenance_task(
     cache: Arc<CacheManager>,
-    invalidation: crate::config::InvalidationConfig,
     poll_interval_secs: u64,
 ) {
     if poll_interval_secs == 0 {
@@ -409,15 +346,11 @@ pub async fn run_maintenance_task(
         tokio::time::sleep(interval).await;
 
         let cache_clone = Arc::clone(&cache);
-        let check = invalidation.check_on_maintenance;
         tokio::task::spawn_blocking(move || {
-            if check {
-                let (checked, dropped) = cache_clone.sweep_stale();
-                tracing::info!(
-                    "maintenance stale sweep: checked={checked} dropped={dropped}"
-                );
-            }
-            cache_clone.evict_if_needed();
+            let (checked, dropped) = cache_clone.sweep_stale();
+            tracing::info!(
+                "maintenance stale sweep: checked={checked} dropped={dropped}"
+            );
         })
         .await
         .ok();
