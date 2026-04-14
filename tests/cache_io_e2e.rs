@@ -22,6 +22,12 @@
 ///
 ///   6. Dedup — submitting the same path twice while the first is still in-flight
 ///      results in exactly one copy, not two concurrent writes.
+///
+///   7. Copy fidelity — the cached file is byte-for-byte identical to the backing file.
+///
+///   8. Metadata preservation — mode and mtime on the backing file survive the copy.
+///
+///   9. No .partial on failure — a failed copy leaves no .partial file in the cache dir.
 mod common;
 
 use std::ffi::CString;
@@ -38,6 +44,9 @@ use fscache::cache::io::{CacheIO, CacheIoConfig};
 use fscache::cache::manager::CacheManager;
 use fscache::config::InvalidationConfig;
 use fscache::engine::scheduler::Scheduler;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
+use filetime;
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -296,5 +305,119 @@ async fn duplicate_submit_produces_one_copy() {
     assert!(
         db.load_deferred(1440).is_empty(),
         "deferred DB row must be cleared after the single copy completes"
+    );
+}
+
+/// The cached file must be a byte-for-byte copy of the backing file. Tests that
+/// `perform_copy`'s explicit read/write loop produces a correct result end-to-end.
+#[tokio::test]
+async fn copy_produces_correct_byte_content() {
+    let backing = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    let rel = PathBuf::from("movies/film.mkv");
+    std::fs::create_dir_all(backing.path().join("movies")).unwrap();
+    // 300 KiB of patterned data — large enough to span multiple 256 KiB copy chunks.
+    let content: Vec<u8> = (0u32..307_200).map(|i| (i % 251) as u8).collect();
+    std::fs::write(backing.path().join(&rel), &content).unwrap();
+
+    let db = make_db(cache_dir.path());
+    let cache_mgr = make_cache_mgr(cache_dir.path(), Arc::clone(&db));
+    let backing_store = open_backing_store(backing.path());
+
+    let cache_io = spawn_cache_io(Arc::clone(&cache_mgr), backing_store, 1440);
+    cache_io.submit_cache(rel.clone()).await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let cached = std::fs::read(cache_dir.path().join(&rel))
+        .expect("cached file not found after copy");
+    assert_eq!(cached, content, "cached file content must be identical to backing file");
+}
+
+/// Mode and mtime set on the backing file must survive the CacheIO copy pipeline.
+/// This exercises `apply_source_metadata` end-to-end via `copy_worker` → `perform_copy`.
+#[tokio::test]
+async fn copy_preserves_metadata() {
+    let backing = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    let rel = PathBuf::from("tv/Show/S01E01.mkv");
+    std::fs::create_dir_all(backing.path().join("tv/Show")).unwrap();
+    std::fs::write(backing.path().join(&rel), b"episode content").unwrap();
+
+    let backing_path = backing.path().join(&rel);
+    std::fs::set_permissions(&backing_path, std::fs::Permissions::from_mode(0o640))
+        .expect("set_permissions failed");
+    filetime::set_file_mtime(
+        &backing_path,
+        filetime::FileTime::from_unix_time(1_700_000_000, 0),
+    ).expect("set_file_mtime failed");
+
+    let db = make_db(cache_dir.path());
+    let cache_mgr = make_cache_mgr(cache_dir.path(), Arc::clone(&db));
+    let backing_store = open_backing_store(backing.path());
+
+    let cache_io = spawn_cache_io(Arc::clone(&cache_mgr), backing_store, 1440);
+    cache_io.submit_cache(rel.clone()).await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let cache_path = cache_dir.path().join(&rel);
+    assert!(cache_path.exists(), "cached file not found after copy");
+
+    let cache_meta = std::fs::metadata(&cache_path).expect("metadata on cache file failed");
+    let backing_meta = std::fs::metadata(&backing_path).expect("metadata on backing file failed");
+
+    assert_eq!(
+        cache_meta.permissions().mode() & 0o7777,
+        backing_meta.permissions().mode() & 0o7777,
+        "cached file mode must match backing file"
+    );
+    assert_eq!(
+        cache_meta.mtime(), backing_meta.mtime(),
+        "cached file mtime must match backing file"
+    );
+}
+
+/// A copy that fails (backing file missing) must not leave a `.partial` file behind.
+#[tokio::test]
+async fn copy_failure_leaves_no_partial_on_disk() {
+    let backing = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    // Intentionally do NOT create the backing file.
+    let rel = PathBuf::from("missing/episode.mkv");
+
+    let db = make_db(cache_dir.path());
+    let cache_mgr = make_cache_mgr(cache_dir.path(), Arc::clone(&db));
+    let backing_store = open_backing_store(backing.path());
+
+    let cache_io = spawn_cache_io(Arc::clone(&cache_mgr), backing_store, 1440);
+    cache_io.submit_cache(rel.clone()).await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Walk the entire cache dir and fail if any .partial file exists.
+    fn find_partials(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    found.extend(find_partials(&path));
+                } else if path.to_string_lossy().ends_with(".partial") {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    let partials = find_partials(cache_dir.path());
+    assert!(
+        partials.is_empty(),
+        "failed copy must not leave .partial files behind: {:?}",
+        partials
     );
 }

@@ -308,7 +308,7 @@ fn copier_copies_file_correctly() {
     let backing_store = make_backing_store(backing.path());
 
     let dest = cache_dir.path().join("test.mkv");
-    fscache::engine::copier::copy_to_cache(
+    fscache::cache::io::copy_for_tests(
         &backing_store,
         std::path::Path::new("test.mkv"),
         &dest,

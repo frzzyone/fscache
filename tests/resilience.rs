@@ -78,7 +78,7 @@ fn concurrent_reads_different_files() {
 
 // ---- Partial-copy cleanup ----
 
-/// copy_to_cache cleans up the .partial file when the source does not exist.
+/// `.partial` file is cleaned up when the source file does not exist.
 #[test]
 fn copier_no_partial_left_on_source_missing() {
     use std::ffi::CString;
@@ -97,7 +97,7 @@ fn copier_no_partial_left_on_source_missing() {
     let bs = BackingStore::new(fd);
 
     // Source file does not exist → copy must fail cleanly
-    let result = fscache::engine::copier::copy_to_cache(
+    let result = fscache::cache::io::copy_for_tests(
         &bs,
         std::path::Path::new("nonexistent.mkv"),
         &dest,

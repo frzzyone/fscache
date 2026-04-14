@@ -1,5 +1,10 @@
 use std::collections::{HashSet, VecDeque};
+use std::ffi::CString;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -73,7 +78,6 @@ impl CacheIO {
     ) -> Self {
         let db = cache.cache_db();
 
-        // Seed the in-memory queue from the persisted DB table, discarding stale entries.
         let mut initial = PipelineState::new();
         let loaded = db.load_deferred(cfg.deferred_ttl_minutes);
         if !loaded.is_empty() {
@@ -105,7 +109,6 @@ impl CacheIO {
             deferred_ttl_minutes: cfg.deferred_ttl_minutes,
         };
 
-        // Dispatcher: drains the queue whenever the caching window is open.
         tokio::spawn(dispatcher(handle.clone()));
 
         // If we rehydrated entries from the DB, wake the dispatcher immediately
@@ -305,7 +308,7 @@ async fn copy_worker(io: CacheIO, rel_path: PathBuf) {
     let rel = rel_path.clone();
     let dest = cache_dest.clone();
     let result = tokio::task::spawn_blocking(move || {
-        crate::engine::copier::copy_to_cache(&bs, &rel, &dest)
+        perform_copy(&bs, &rel, &dest)
     })
     .await;
 
@@ -352,7 +355,7 @@ async fn finish_known(io: &CacheIO, rel_path: &Path) {
 
 async fn eviction_worker(cache: Arc<CacheManager>, interval_secs: u64) {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
-    ticker.tick().await; // consume the immediate first tick
+    ticker.tick().await;
     loop {
         ticker.tick().await;
         let cache_clone = Arc::clone(&cache);
@@ -367,4 +370,118 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Uses an explicit read/write loop rather than `std::io::copy` so that
+/// byte-level progress reporting can be added (tick `bytes_done` per chunk)
+/// without restructuring this function.
+fn perform_copy(
+    bs: &BackingStore,
+    rel_path: &Path,
+    cache_dest: &Path,
+) -> std::io::Result<()> {
+    if let Some(parent) = cache_dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let partial = partial_path(cache_dest);
+
+    let src_fd = bs.open_file(rel_path)?;
+    // Safety: bs.open_file returns an owned fd. File::from_raw_fd takes
+    // ownership, so Drop closes it on all return paths — no libc::close needed.
+    let mut src = unsafe { File::from_raw_fd(src_fd) };
+
+    let src_meta = src.metadata()?;
+    let file_size_bytes = src_meta.len();
+    tracing::info!(
+        "copy starting: {} ({:.1} MB)",
+        rel_path.display(),
+        file_size_bytes as f64 / 1_048_576.0,
+    );
+
+    let started = std::time::Instant::now();
+
+    let mut dst = match OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&partial)
+    {
+        Ok(f) => f,
+        Err(e) => return Err(e),
+    };
+
+    let copy_result: std::io::Result<()> = (|| {
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = src.read(&mut buf)?;
+            if n == 0 { break; }
+            dst.write_all(&buf[..n])?;
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = copy_result {
+        let _ = std::fs::remove_file(&partial);
+        return Err(e);
+    }
+
+    if let Err(e) = dst.sync_all() {
+        let _ = std::fs::remove_file(&partial);
+        return Err(e);
+    }
+    drop(dst);
+
+    apply_source_metadata(&partial, &src_meta);
+
+    if let Err(e) = std::fs::rename(&partial, cache_dest) {
+        let _ = std::fs::remove_file(&partial);
+        return Err(e);
+    }
+
+    tracing::info!(
+        "copy complete: {} ({:.1} MB in {:.1}s)",
+        rel_path.display(),
+        file_size_bytes as f64 / 1_048_576.0,
+        started.elapsed().as_secs_f64(),
+    );
+    Ok(())
+}
+
+fn partial_path(dest: &Path) -> PathBuf {
+    let mut s = dest.as_os_str().to_owned();
+    s.push(".partial");
+    PathBuf::from(s)
+}
+
+/// Best-effort: all syscalls are fire-and-forget.
+fn apply_source_metadata(path: &Path, meta: &std::fs::Metadata) {
+    let Ok(c) = CString::new(path.as_os_str().as_bytes()) else { return };
+    unsafe {
+        libc::chmod(c.as_ptr(), (meta.mode() & 0o7777) as libc::mode_t);
+        libc::lchown(c.as_ptr(), meta.uid(), meta.gid());
+        let times = [
+            libc::timespec {
+                tv_sec:  meta.atime()      as libc::time_t,
+                tv_nsec: meta.atime_nsec() as libc::c_long,
+            },
+            libc::timespec {
+                tv_sec:  meta.mtime()      as libc::time_t,
+                tv_nsec: meta.mtime_nsec() as libc::c_long,
+            },
+        ];
+        libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0);
+    }
+}
+
+/// Thin wrapper around `perform_copy` for integration tests.
+/// Production copies go through `CacheIO::submit_cache` / `copy_worker`.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn copy_for_tests(
+    bs: &BackingStore,
+    rel_path: &Path,
+    cache_dest: &Path,
+) -> std::io::Result<()> {
+    perform_copy(bs, rel_path, cache_dest)
 }
