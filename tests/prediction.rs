@@ -18,6 +18,7 @@ use fscache::preset::CachePreset;
 use fscache::prediction_utils::{parse_season_dir, parse_season_episode, show_root};
 use fscache::presets::plex_episode_prediction::PlexEpisodePrediction;
 use fscache::engine::scheduler::Scheduler;
+use tokio_util::sync::CancellationToken;
 
 // ---- Scheduler tests ----
 
@@ -85,13 +86,15 @@ fn make_engine(
     lookahead: usize,
     backing_store: Arc<BackingStore>,
     max_cache_pull_bytes: u64,
+    shutdown: CancellationToken,
 ) -> ActionEngine {
     let scheduler = Scheduler::new("00:00", "23:59").unwrap();
-    let cache_io = CacheIO::spawn(
+    let (cache_io, _io_handles) = CacheIO::spawn(
         CacheIoConfig { max_concurrent_copies: 1, eviction_interval_secs: 0, deferred_ttl_minutes: 0 },
         Arc::clone(&cache),
         Arc::clone(&backing_store),
         scheduler,
+        shutdown,
     );
     let preset = Arc::new(PlexEpisodePrediction::new(lookahead, vec![], false));
     ActionEngine::new(
@@ -138,8 +141,8 @@ async fn predictor_caches_next_episodes_via_regex() {
 
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
 
-    let engine = make_engine(access_rx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0);
-    tokio::spawn(engine.run());
+    let engine = make_engine(access_rx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0, CancellationToken::new());
+    tokio::spawn(engine.run(CancellationToken::new()));
 
     access_tx
         .send(AccessEvent::miss(PathBuf::from("tv/Show/Show.S01E01.mkv")))
@@ -189,8 +192,8 @@ async fn predictor_skips_already_cached() {
         &Default::default(),
     ));
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
-    let engine = make_engine(access_rx, Arc::clone(&cache), 2, Arc::clone(&backing_store), 0);
-    tokio::spawn(engine.run());
+    let engine = make_engine(access_rx, Arc::clone(&cache), 2, Arc::clone(&backing_store), 0, CancellationToken::new());
+    tokio::spawn(engine.run(CancellationToken::new()));
 
     access_tx
         .send(AccessEvent::miss(PathBuf::from("tv/Show/Show.S01E01.mkv")))
@@ -248,8 +251,8 @@ async fn regex_crosses_season_boundary_structured_layout() {
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
     let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default()));
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
-    let engine = make_engine(access_rx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0);
-    tokio::spawn(engine.run());
+    let engine = make_engine(access_rx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0, CancellationToken::new());
+    tokio::spawn(engine.run(CancellationToken::new()));
 
     access_tx.send(AccessEvent::miss(PathBuf::from("Show/Season 1/Show.S01E03.mkv"))).unwrap();
 
@@ -282,8 +285,8 @@ async fn regex_crosses_season_boundary_flat_layout() {
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
     let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default()));
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
-    let engine = make_engine(access_rx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0);
-    tokio::spawn(engine.run());
+    let engine = make_engine(access_rx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0, CancellationToken::new());
+    tokio::spawn(engine.run(CancellationToken::new()));
 
     access_tx.send(AccessEvent::miss(PathBuf::from("Show/Show.S01E03.mkv"))).unwrap();
 
@@ -338,8 +341,8 @@ async fn predictor_budget_zero_means_disabled() {
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
     let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default()));
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
-    let engine = make_engine(access_rx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0);
-    tokio::spawn(engine.run());
+    let engine = make_engine(access_rx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 0, CancellationToken::new());
+    tokio::spawn(engine.run(CancellationToken::new()));
 
     access_tx.send(AccessEvent::miss(PathBuf::from("tv/Show/Show.S01E01.mkv"))).unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -365,8 +368,8 @@ async fn predictor_respects_max_cache_pull_budget() {
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
     let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default()));
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
-    let engine = make_engine(access_rx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 250);
-    tokio::spawn(engine.run());
+    let engine = make_engine(access_rx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 250, CancellationToken::new());
+    tokio::spawn(engine.run(CancellationToken::new()));
 
     access_tx.send(AccessEvent::miss(PathBuf::from("tv/Show/Show.S01E01.mkv"))).unwrap();
     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -393,8 +396,8 @@ async fn predictor_first_candidate_always_queued() {
     let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db")).unwrap());
     let cache = Arc::new(CacheManager::new(cache_dir.path().to_path_buf(), db, cache_dir.path().to_path_buf(), 1.0, 72, 0.0, None, &Default::default()));
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
-    let engine = make_engine(access_rx, Arc::clone(&cache), 2, Arc::clone(&backing_store), 50);
-    tokio::spawn(engine.run());
+    let engine = make_engine(access_rx, Arc::clone(&cache), 2, Arc::clone(&backing_store), 50, CancellationToken::new());
+    tokio::spawn(engine.run(CancellationToken::new()));
 
     access_tx.send(AccessEvent::miss(PathBuf::from("tv/Show/Show.S01E01.mkv"))).unwrap();
     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -425,8 +428,8 @@ async fn predictor_budget_includes_existing_cache() {
     // Reconcile the pre-placed E02 into the DB so total_cached_bytes() accounts for it.
     cache.startup_cleanup();
     let (access_tx, access_rx) = mpsc::unbounded_channel::<AccessEvent>();
-    let engine = make_engine(access_rx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 250);
-    tokio::spawn(engine.run());
+    let engine = make_engine(access_rx, Arc::clone(&cache), 4, Arc::clone(&backing_store), 250, CancellationToken::new());
+    tokio::spawn(engine.run(CancellationToken::new()));
 
     access_tx.send(AccessEvent::miss(PathBuf::from("tv/Show/Show.S01E02.mkv"))).unwrap();
     tokio::time::sleep(Duration::from_millis(600)).await;

@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
-use tokio::sync::{broadcast, watch};
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 use fscache::cache::db::CacheDb;
 use fscache::config::{
@@ -78,7 +79,7 @@ async fn ipc_hello_received_and_fields_match() {
     let socket_path = tmp.path().join("test.sock");
 
     let (ipc_tx, _) = broadcast::channel::<DaemonMessage>(64);
-    let (sd_tx, sd_rx) = watch::channel(false);
+    let shutdown = CancellationToken::new();
 
     let (hello_msg, expected) = make_hello(&socket_path.to_string_lossy());
 
@@ -88,8 +89,7 @@ async fn ipc_hello_received_and_fields_match() {
         sp,
         hello_msg,
         ipc_tx,
-        sd_tx,
-        sd_rx,
+        shutdown,
         empty_recent(),
         in_memory_db(),
     ));
@@ -117,11 +117,10 @@ async fn ipc_events_applied_to_dashboard_state() {
     let socket_path = tmp.path().join("events.sock");
 
     let (ipc_tx, _) = broadcast::channel::<DaemonMessage>(64);
-    let (sd_tx, sd_rx) = watch::channel(false);
     let (hello_msg, _) = make_hello(&socket_path.to_string_lossy());
 
     let sp = socket_path.clone();
-    tokio::spawn(run_ipc_server(sp, hello_msg, ipc_tx.clone(), sd_tx, sd_rx, empty_recent(), in_memory_db()));
+    tokio::spawn(run_ipc_server(sp, hello_msg, ipc_tx.clone(), CancellationToken::new(), empty_recent(), in_memory_db()));
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -162,11 +161,10 @@ async fn ipc_log_lines_pushed_to_ring_buffer() {
     let socket_path = tmp.path().join("logs.sock");
 
     let (ipc_tx, _) = broadcast::channel::<DaemonMessage>(64);
-    let (sd_tx, sd_rx) = watch::channel(false);
     let (hello_msg, _) = make_hello(&socket_path.to_string_lossy());
 
     let sp = socket_path.clone();
-    tokio::spawn(run_ipc_server(sp, hello_msg, ipc_tx.clone(), sd_tx, sd_rx, empty_recent(), in_memory_db()));
+    tokio::spawn(run_ipc_server(sp, hello_msg, ipc_tx.clone(), CancellationToken::new(), empty_recent(), in_memory_db()));
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let (_hello, mut reader, _writer) = client::connect(&socket_path).await.unwrap();
@@ -195,11 +193,11 @@ async fn ipc_client_shutdown_triggers_daemon_signal() {
     let socket_path = tmp.path().join("shutdown.sock");
 
     let (ipc_tx, _) = broadcast::channel::<DaemonMessage>(64);
-    let (sd_tx, mut sd_rx) = watch::channel(false);
+    let shutdown = CancellationToken::new();
     let (hello_msg, _) = make_hello(&socket_path.to_string_lossy());
 
     let sp = socket_path.clone();
-    tokio::spawn(run_ipc_server(sp, hello_msg, ipc_tx, sd_tx, sd_rx.clone(), empty_recent(), in_memory_db()));
+    tokio::spawn(run_ipc_server(sp, hello_msg, ipc_tx, shutdown.clone(), empty_recent(), in_memory_db()));
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Connect with raw framed stream so we can send ClientMessage directly.
@@ -212,15 +210,9 @@ async fn ipc_client_shutdown_triggers_daemon_signal() {
     // Send Shutdown.
     send_msg(&mut writer, &ClientMessage::Shutdown).await.unwrap();
 
-    // Wait for the watch channel to flip.
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            sd_rx.changed().await.ok();
-            if *sd_rx.borrow() { break; }
-        }
-    })
-    .await
-    .expect("daemon should signal shutdown within 2 seconds");
+    tokio::time::timeout(Duration::from_secs(2), shutdown.cancelled())
+        .await
+        .expect("daemon should signal shutdown within 2 seconds");
 }
 
 #[tokio::test]
@@ -229,11 +221,11 @@ async fn ipc_goodbye_on_daemon_shutdown() {
     let socket_path = tmp.path().join("goodbye.sock");
 
     let (ipc_tx, _) = broadcast::channel::<DaemonMessage>(64);
-    let (sd_tx, sd_rx) = watch::channel(false);
+    let shutdown = CancellationToken::new();
     let (hello_msg, _) = make_hello(&socket_path.to_string_lossy());
 
     let sp = socket_path.clone();
-    tokio::spawn(run_ipc_server(sp, hello_msg, ipc_tx, sd_tx.clone(), sd_rx, empty_recent(), in_memory_db()));
+    tokio::spawn(run_ipc_server(sp, hello_msg, ipc_tx, shutdown.clone(), empty_recent(), in_memory_db()));
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
@@ -244,7 +236,7 @@ async fn ipc_goodbye_on_daemon_shutdown() {
     assert!(matches!(first, DaemonMessage::Hello(_)));
 
     // Signal daemon shutdown.
-    let _ = sd_tx.send(true);
+    shutdown.cancel();
 
     // Expect Goodbye.
     let msg = tokio::time::timeout(Duration::from_secs(2), recv_msg::<DaemonMessage>(&mut reader))
@@ -266,10 +258,9 @@ async fn ipc_discover_finds_running_instance() {
     let (hello_msg, _) = make_hello(&sp.to_string_lossy());
 
     let (ipc_tx, _) = broadcast::channel::<DaemonMessage>(64);
-    let (sd_tx, sd_rx) = watch::channel(false);
 
     let sp_clone = sp.clone();
-    let server = tokio::spawn(run_ipc_server(sp_clone, hello_msg, ipc_tx, sd_tx, sd_rx, empty_recent(), in_memory_db()));
+    let server = tokio::spawn(run_ipc_server(sp_clone, hello_msg, ipc_tx, CancellationToken::new(), empty_recent(), in_memory_db()));
 
     tokio::time::sleep(Duration::from_millis(80)).await;
 
@@ -323,7 +314,6 @@ async fn full_pipeline_tracing_through_ipc_to_dashboard() {
     db.set_last_hit_at_for_test(&refresh_rel, &mount_id, old_ts);
 
     let (ipc_tx, _) = broadcast::channel::<DaemonMessage>(256);
-    let (sd_tx, sd_rx) = watch::channel(false);
     let (hello_msg, _) = make_hello(&socket_path.to_string_lossy());
 
     let recent = empty_recent();
@@ -337,7 +327,7 @@ async fn full_pipeline_tracing_through_ipc_to_dashboard() {
 
     // ---- Start IPC server ----
     let sp = socket_path.clone();
-    tokio::spawn(run_ipc_server(sp, hello_msg, ipc_tx, sd_tx, sd_rx, recent, Arc::clone(&db)));
+    tokio::spawn(run_ipc_server(sp, hello_msg, ipc_tx, CancellationToken::new(), recent, Arc::clone(&db)));
 
     // Let the server bind.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -505,7 +495,6 @@ async fn ipc_replay_recent_logs_on_connect() {
     let socket_path = tmp.path().join("replay.sock");
 
     let (ipc_tx, _) = broadcast::channel::<DaemonMessage>(64);
-    let (sd_tx, sd_rx) = watch::channel(false);
     let (hello_msg, _) = make_hello(&socket_path.to_string_lossy());
 
     // Pre-populate the ring buffer with log lines before any client connects.
@@ -523,7 +512,7 @@ async fn ipc_replay_recent_logs_on_connect() {
     }
 
     let sp = socket_path.clone();
-    tokio::spawn(run_ipc_server(sp, hello_msg, ipc_tx, sd_tx, sd_rx, recent, in_memory_db()));
+    tokio::spawn(run_ipc_server(sp, hello_msg, ipc_tx, CancellationToken::new(), recent, in_memory_db()));
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Connect a client — it should receive the replayed log lines.
@@ -568,11 +557,10 @@ async fn ipc_evict_files_removes_file_and_db_row() {
     assert_eq!(used, 15);
 
     let (ipc_tx, _) = broadcast::channel::<DaemonMessage>(64);
-    let (sd_tx, sd_rx) = watch::channel(false);
     let (hello_msg, _) = make_hello(&socket_path.to_string_lossy());
 
     let sp = socket_path.clone();
-    tokio::spawn(run_ipc_server(sp, hello_msg, ipc_tx, sd_tx, sd_rx, empty_recent(), Arc::clone(&db)));
+    tokio::spawn(run_ipc_server(sp, hello_msg, ipc_tx, CancellationToken::new(), empty_recent(), Arc::clone(&db)));
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Connect and send EvictFiles.
@@ -618,11 +606,10 @@ async fn ipc_refresh_lease_updates_last_hit_at() {
         "last_hit_at should be in the past before refresh");
 
     let (ipc_tx, _) = broadcast::channel::<DaemonMessage>(64);
-    let (sd_tx, sd_rx) = watch::channel(false);
     let (hello_msg, _) = make_hello(&socket_path.to_string_lossy());
 
     let sp = socket_path.clone();
-    tokio::spawn(run_ipc_server(sp, hello_msg, ipc_tx, sd_tx, sd_rx, empty_recent(), Arc::clone(&db)));
+    tokio::spawn(run_ipc_server(sp, hello_msg, ipc_tx, CancellationToken::new(), empty_recent(), Arc::clone(&db)));
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
