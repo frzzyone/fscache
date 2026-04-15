@@ -21,6 +21,32 @@ https://github.com/DudeCmonMan/fscache/blob/main/docker/README.md (I'm still loo
 
 If this utility helped you, I would really appreciate a star!
 
+---
+
+## Changes in this fork
+
+This fork ([frzzyone/fscache](https://github.com/frzzyone/fscache)) adds two features on top of upstream:
+
+### Tee-on-read (zero extra NFS bandwidth on cache miss)
+
+When an uncached file is opened, upstream fscache serves it from NFS while a background copy worker reads the same file from NFS a second time to populate the cache — consuming double the bandwidth. This fork eliminates that second read.
+
+As FUSE read data flows from NFS to the client, it is simultaneously written to the SSD cache as a side-effect. When the client finishes reading the file, it is already cached with no additional NFS traffic. If the client seeks forward into unwritten data (a gap the tee cannot fill), the tee aborts gracefully and the normal background copy pipeline takes over. Backward seeks within already-written data are tolerated — media players such as Plex routinely seek back a few hundred KB for MKV cluster boundary alignment.
+
+### `process_allowlist` for `prefetch` and `plex-episode-prediction` presets
+
+Complements the existing `process_blocklist`. When `process_allowlist` is non-empty, **only** processes in that list (and their children) can trigger caching; all other processes are silently ignored. The allowlist is checked before the blocklist.
+
+```toml
+[plex]
+process_allowlist = ["Plex Media Server"]  # only this process triggers prediction
+
+[prefetch]
+process_allowlist = ["myapp"]  # only this process triggers prefetch
+```
+
+An empty list (the default) disables the allowlist and falls through to the existing `process_blocklist` logic.
+
 # WARNING: PLEASE READ THIS BEFORE TRYING
 
 **This is a new project. I HIGHLY recommend you DISABLE automatic trash emptying in Plex while evaluating this software. Filesystem mounting/unmounting is potentially dangerous on a live server. If Plex detects a drive went down and you have automatic trash cleanup enabled, it WILL delete your Plex metadata (not the files — just watch history, ratings, etc.). My codebase has extensive automated testing that protects against this type of failure, but please be safe. If you're using this tool, you're probably hoarding data like me and I would HATE to see a critical bug break your metadata.**
@@ -68,6 +94,7 @@ General-purpose preset with three caching modes and optional regex filtering. No
 
 - **`file_whitelist`** — regex patterns matched against filename. Only matching files are cached. Empty list means allow all.
 - **`file_blacklist`** — regex patterns matched against filename. Matching files are never cached. Blacklist is checked first and always wins over whitelist.
+- **`process_allowlist`** — process names (and their children) that are the only ones allowed to trigger caching. Empty list disables the allowlist. Checked before blocklist.
 - **`process_blocklist`** — process names (and their children) that must never trigger caching.
 
 All regex patterns are compiled at startup. Invalid patterns cause the daemon to refuse to start — no silent failures at runtime.
@@ -187,6 +214,7 @@ Used when `preset.name` is `plex-episode-prediction` (or `episode-prediction`).
 |---|---|---|
 | `plex.lookahead` | `4` | Episodes to pre-cache ahead of current position |
 | `plex.mode` | `miss-only` | `miss-only` (predict on miss) or `rolling-buffer` (keep next N always loaded) |
+| `plex.process_allowlist` | `[]` | Process names (and their children) that are the **only** ones allowed to trigger prediction. Empty = disabled, falls through to blocklist. |
 | `plex.process_blocklist` | `[]` | Process names that must never trigger prediction |
 
 ### Prefetch
@@ -197,6 +225,7 @@ Used when `preset.name` is `prefetch`.
 |---|---|---|
 | `prefetch.mode` | `cache-hit-only` | `cache-hit-only`, `cache-neighbors`, or `cache-parent-recursively` |
 | `prefetch.max_depth` | `3` | Max recursion depth for `cache-parent-recursively` mode |
+| `prefetch.process_allowlist` | `[]` | Process names (and their children) that are the **only** ones allowed to trigger caching. Empty = disabled, falls through to blocklist. |
 | `prefetch.process_blocklist` | `[]` | Process names that must never trigger caching |
 | `prefetch.file_whitelist` | `[]` | Regex patterns — only matching filenames are cached (empty = allow all) |
 | `prefetch.file_blacklist` | `[]` | Regex patterns — matching filenames are never cached (checked before whitelist) |
