@@ -68,6 +68,11 @@ pub struct CacheIO {
     semaphore:            Arc<Semaphore>,
     evict_lock:           Arc<Mutex<()>>,
     deferred_ttl_minutes: u64,
+    /// Paths currently being written by a tee-on-read FUSE handler.
+    /// Uses a std::sync::Mutex so FUSE sync handlers can access it without tokio.
+    /// submit_cache and copy_worker both check this to avoid conflicting with an
+    /// in-progress tee write to the same .partial file.
+    tee_set: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
 }
 
 impl CacheIO {
@@ -114,6 +119,7 @@ impl CacheIO {
             semaphore: Arc::new(Semaphore::new(cfg.max_concurrent_copies)),
             evict_lock: Arc::new(Mutex::new(())),
             deferred_ttl_minutes: cfg.deferred_ttl_minutes,
+            tee_set: Arc::new(std::sync::Mutex::new(HashSet::new())),
         };
 
         let mut task_handles = Vec::new();
@@ -137,6 +143,24 @@ impl CacheIO {
         (handle, task_handles)
     }
 
+    /// Reserve `path` for tee-on-read. Returns `true` if the reservation was granted
+    /// (i.e. no other tee is active for this path). Returns `false` if a tee is already
+    /// in progress (caller should not start a second tee for the same file).
+    ///
+    /// This method is synchronous so it can be called from FUSE handlers without tokio.
+    pub fn try_reserve_for_tee(&self, path: &PathBuf) -> bool {
+        self.tee_set.lock().unwrap().insert(path.clone())
+    }
+
+    /// Release a tee reservation previously acquired via `try_reserve_for_tee`.
+    /// Call this when the tee completes (success or abort) so CacheIO can copy
+    /// the file via the normal pipeline if needed.
+    ///
+    /// This method is synchronous so it can be called from FUSE handlers without tokio.
+    pub fn release_tee_reservation(&self, path: &PathBuf) {
+        self.tee_set.lock().unwrap().remove(path);
+    }
+
     /// Submit a path for caching. This is the single entrypoint for all cache requests.
     ///
     /// The path is pushed onto the queue unconditionally (subject to dedup and
@@ -146,6 +170,14 @@ impl CacheIO {
         // Cheap check before taking the lock — avoids contention on cache hits.
         if self.cache.is_cached(&rel_path) {
             tracing::debug!("cache_io: {} already cached, skipping", rel_path.display());
+            return;
+        }
+
+        // Skip files currently being written by a tee-on-read handler.
+        // When the tee completes it calls mark_cached(); if it aborts, the tee
+        // reservation is released and the normal AccessEvent::close path handles it.
+        if self.tee_set.lock().unwrap().contains(&rel_path) {
+            tracing::debug!("cache_io: {} is being tee'd, skipping copy", rel_path.display());
             return;
         }
 
@@ -272,6 +304,14 @@ async fn dispatcher(io: CacheIO, shutdown: CancellationToken) {
 }
 
 async fn copy_worker(io: CacheIO, rel_path: PathBuf) {
+    // Guard against the rare race where a tee reservation was inserted between
+    // submit_cache's tee_set check and the dispatcher spawning this worker.
+    if io.tee_set.lock().unwrap().contains(&rel_path) {
+        tracing::debug!("cache_io: {} is being tee'd, deferring copy worker", rel_path.display());
+        finish_known(&io, &rel_path).await;
+        return;
+    }
+
     if io.cache.is_cached(&rel_path) {
         tracing::debug!("cache_io: {} already cached, skipping", rel_path.display());
         finish_known(&io, &rel_path).await;

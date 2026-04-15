@@ -331,6 +331,10 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             background.spawn(async move { let _ = h.await; });
         }
 
+        // Clone before moving into ActionEngine so FUSE can hold a handle for tee-on-read.
+        let cache_io_for_fuse = cache_io.clone();
+        fs.cache_io = Some(cache_io_for_fuse);
+
         let engine = engine::action::ActionEngine::new(
             access_rx,
             cache_io,

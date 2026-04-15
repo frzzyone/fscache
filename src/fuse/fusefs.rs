@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::backing_store::BackingStore;
+use crate::cache::io::CacheIO;
+use crate::cache::tee::TeeWriter;
 use crate::preset::{CachePreset, ProcessInfo};
 use crate::telemetry;
 
@@ -38,6 +40,12 @@ pub struct FsCache {
     open_bytes: Mutex<HashMap<u64, u64>>,
     /// Path for each open file handle — used to send on_close events.
     open_paths: Mutex<HashMap<u64, PathBuf>>,
+    /// Handle to CacheIO for tee-on-read reservation and coordination.
+    pub cache_io: Option<CacheIO>,
+    /// Active tee writers, keyed by file handle. Tee-on-read writes incoming FUSE
+    /// read data to the SSD cache as a side-effect, eliminating the redundant NFS
+    /// read that CacheIO would otherwise perform.
+    tee_writers: Mutex<HashMap<u64, TeeWriter>>,
 }
 
 impl FsCache {
@@ -69,6 +77,8 @@ impl FsCache {
             recent_logs: Mutex::new(HashMap::new()),
             open_bytes: Mutex::new(HashMap::new()),
             open_paths: Mutex::new(HashMap::new()),
+            cache_io: None,
+            tee_writers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -340,6 +350,51 @@ impl Filesystem for FsCache {
         }
 
         if !filtered && !self.passthrough_mode {
+            // Attempt tee-on-read: write incoming FUSE data to SSD as a side-effect.
+            // The reservation must be inserted BEFORE sending AccessEvent::miss so
+            // that ActionEngine → submit_cache sees the tee_set entry and skips queuing.
+            if let (Some(cache_io), Some(cache)) = (&self.cache_io, &self.cache) {
+                if cache.has_free_space() && cache_io.try_reserve_for_tee(&path) {
+                    let final_path = cache.cache_path(&path);
+                    let mut partial_os = final_path.as_os_str().to_owned();
+                    partial_os.push(".partial");
+                    let partial_path = PathBuf::from(partial_os);
+
+                    let file_size = self.backing_store.stat(&path)
+                        .map(|s| s.st_size as u64)
+                        .unwrap_or(0);
+
+                    let tee_started = if file_size > 0 {
+                        if let Some(parent) = partial_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        match std::fs::OpenOptions::new()
+                            .write(true).create(true).truncate(true)
+                            .open(&partial_path)
+                        {
+                            Ok(tee_file) => {
+                                let writer = TeeWriter::new(
+                                    path.clone(), partial_path, final_path, tee_file, file_size,
+                                );
+                                self.tee_writers.lock().unwrap().insert(fd as u64, writer);
+                                tracing::debug!("tee: started for {}", path.display());
+                                true
+                            }
+                            Err(e) => {
+                                tracing::warn!("tee: failed to open partial file for {}: {}", path.display(), e);
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
+
+                    if !tee_started {
+                        cache_io.release_tee_reservation(&path);
+                    }
+                }
+            }
+
             if let Some(ref tx) = self.access_tx {
                 let _ = tx.send(AccessEvent::miss(path.clone()));
             }
@@ -381,6 +436,30 @@ impl Filesystem for FsCache {
             *bytes += n as u64;
         }
 
+        // Feed data to tee writer. On seek (non-sequential offset) or write error,
+        // abort the tee and release the reservation so CacheIO can copy the file.
+        let abort_path = {
+            let mut tee_map = self.tee_writers.lock().unwrap();
+            if let Some(tee) = tee_map.get_mut(&fh.0) {
+                if !tee.write_sequential(&buf, offset) {
+                    let tee = tee_map.remove(&fh.0).unwrap();
+                    let path = tee.rel_path.clone();
+                    tee.cleanup();
+                    Some(path)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(path) = abort_path {
+            tracing::debug!("tee: aborted (seek or write error) for {}", path.display());
+            if let Some(cache_io) = &self.cache_io {
+                cache_io.release_tee_reservation(&path);
+            }
+        }
+
         reply.data(&buf);
     }
 
@@ -397,6 +476,65 @@ impl Filesystem for FsCache {
         let bytes_read = self.open_bytes.lock().unwrap().remove(&fh.0).unwrap_or(0);
         let path = self.open_paths.lock().unwrap().remove(&fh.0);
         tracing::debug!(event = telemetry::EVENT_HANDLE_CLOSED, bytes_read, "handle closed");
+
+        // Finalize or cleanup any active tee for this handle.
+        let tee = self.tee_writers.lock().unwrap().remove(&fh.0);
+        if let Some(tee) = tee {
+            use std::os::unix::fs::MetadataExt;
+            let rel_path = tee.rel_path.clone();
+            let partial_path = tee.partial_path.clone();
+            let final_path = tee.final_path.clone();
+            let is_complete = tee.is_complete();
+
+            if is_complete {
+                match tee.sync() {
+                    Ok(f) => {
+                        drop(f);
+                        match std::fs::rename(&partial_path, &final_path) {
+                            Ok(()) => {
+                                if let Some(cache) = &self.cache {
+                                    match std::fs::metadata(&final_path) {
+                                        Ok(meta) => {
+                                            cache.mark_cached(
+                                                &rel_path,
+                                                meta.len(),
+                                                meta.mtime(),
+                                                meta.mtime_nsec(),
+                                            );
+                                            tracing::info!(
+                                                "tee: cached {} via tee-on-read ({:.1} MB)",
+                                                rel_path.display(),
+                                                meta.len() as f64 / 1_048_576.0,
+                                            );
+                                        }
+                                        Err(e) => tracing::warn!(
+                                            "tee: metadata failed after rename for {}: {}",
+                                            rel_path.display(), e
+                                        ),
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("tee: rename failed for {}: {}", rel_path.display(), e);
+                                let _ = std::fs::remove_file(&partial_path);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("tee: sync failed for {}: {}", rel_path.display(), e);
+                        let _ = std::fs::remove_file(&partial_path);
+                    }
+                }
+            } else {
+                tee.cleanup();
+                tracing::debug!("tee: incomplete on release for {}", rel_path.display());
+            }
+
+            if let Some(cache_io) = &self.cache_io {
+                cache_io.release_tee_reservation(&rel_path);
+            }
+        }
+
         if let (Some(path), Some(tx)) = (path, &self.access_tx) {
             let _ = tx.send(AccessEvent::close(path, bytes_read));
         }

@@ -383,6 +383,99 @@ async fn copy_preserves_metadata() {
     );
 }
 
+/// `submit_cache` skips a path while a tee reservation is held for it, preventing
+/// the copy pipeline from writing to the same `.partial` file concurrently.
+#[tokio::test]
+async fn submit_cache_skips_path_while_tee_reserved() {
+    let backing = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    let rel = PathBuf::from("movies/film.mkv");
+    std::fs::create_dir_all(backing.path().join("movies")).unwrap();
+    std::fs::write(backing.path().join(&rel), b"movie content").unwrap();
+
+    let db = make_db(cache_dir.path());
+    let cache_mgr = make_cache_mgr(cache_dir.path(), Arc::clone(&db));
+    let backing_store = open_backing_store(backing.path());
+
+    let cache_io = spawn_cache_io(Arc::clone(&cache_mgr), backing_store, 1440);
+
+    // Simulate a tee-on-read reservation (as FUSE open() would do).
+    assert!(cache_io.try_reserve_for_tee(&rel));
+
+    // submit_cache must skip the path because the tee reservation is held.
+    cache_io.submit_cache(rel.clone()).await;
+
+    assert!(
+        db.load_deferred(1440).is_empty(),
+        "submit_cache must not queue a path that has an active tee reservation"
+    );
+
+    // After releasing the reservation, submit_cache must queue normally.
+    cache_io.release_tee_reservation(&rel);
+    cache_io.submit_cache(rel.clone()).await;
+
+    assert_eq!(
+        db.load_deferred(1440).len(), 1,
+        "submit_cache must queue normally after tee reservation is released"
+    );
+}
+
+/// Only one tee reservation can be held for a given path at a time.
+#[tokio::test]
+async fn tee_reservation_is_exclusive() {
+    let backing = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    let rel = PathBuf::from("tv/ep01.mkv");
+
+    let db = make_db(cache_dir.path());
+    let cache_mgr = make_cache_mgr(cache_dir.path(), Arc::clone(&db));
+    let backing_store = open_backing_store(backing.path());
+    let cache_io = spawn_cache_io(cache_mgr, backing_store, 1440);
+
+    assert!(cache_io.try_reserve_for_tee(&rel), "first reservation must succeed");
+    assert!(!cache_io.try_reserve_for_tee(&rel), "second reservation for same path must fail");
+
+    cache_io.release_tee_reservation(&rel);
+    assert!(cache_io.try_reserve_for_tee(&rel), "reservation must succeed after release");
+    cache_io.release_tee_reservation(&rel);
+}
+
+/// After a tee completes (mark_cached called externally), submit_cache must skip the
+/// path because is_cached() returns true — no double copy.
+#[tokio::test]
+async fn submit_cache_skips_path_after_tee_marks_cached() {
+    let backing = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    let rel = PathBuf::from("movies/teed.mkv");
+    std::fs::create_dir_all(backing.path().join("movies")).unwrap();
+    let content = b"teed content";
+    std::fs::write(backing.path().join(&rel), content).unwrap();
+
+    let db = make_db(cache_dir.path());
+    let cache_mgr = make_cache_mgr(cache_dir.path(), Arc::clone(&db));
+    let backing_store = open_backing_store(backing.path());
+    let cache_io = spawn_cache_io(Arc::clone(&cache_mgr), backing_store, 1440);
+
+    // Simulate tee completing: write to cache dir and mark_cached.
+    let cache_dest = cache_mgr.cache_path(&rel);
+    std::fs::create_dir_all(cache_dest.parent().unwrap()).unwrap();
+    std::fs::write(&cache_dest, content).unwrap();
+    let meta = std::fs::metadata(&cache_dest).unwrap();
+    use std::os::unix::fs::MetadataExt as _;
+    cache_mgr.mark_cached(&rel, meta.len(), meta.mtime(), meta.mtime_nsec());
+
+    // Now submit_cache must bail on the is_cached() check.
+    cache_io.submit_cache(rel.clone()).await;
+
+    assert!(
+        db.load_deferred(1440).is_empty(),
+        "submit_cache must not queue a path already cached by the tee"
+    );
+}
+
 /// A copy that fails (backing file missing) must not leave a `.partial` file behind.
 #[tokio::test]
 async fn copy_failure_leaves_no_partial_on_disk() {
