@@ -93,7 +93,7 @@ fn make_engine(
         Arc::clone(&backing_store),
         scheduler,
     );
-    let preset = Arc::new(PlexEpisodePrediction::new(lookahead, vec![], false));
+    let preset = Arc::new(PlexEpisodePrediction::new(lookahead, vec![], vec![], false));
     ActionEngine::new(
         access_rx,
         cache_io,

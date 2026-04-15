@@ -153,7 +153,7 @@ impl FuseHarness {
     /// The predictor/copier tasks are spawned on the current tokio runtime — call this
     /// from inside `#[tokio::test]`.
     pub fn new_full_pipeline(lookahead: usize) -> anyhow::Result<Self> {
-        let preset = Arc::new(PlexEpisodePrediction::new(lookahead, vec![], false));
+        let preset = Arc::new(PlexEpisodePrediction::new(lookahead, vec![], vec![], false));
         Self::new_full_pipeline_with_preset(preset)
     }
 
@@ -163,7 +163,7 @@ impl FuseHarness {
         lookahead: usize,
         blocklist: Vec<String>,
     ) -> anyhow::Result<Self> {
-        let preset = Arc::new(PlexEpisodePrediction::new(lookahead, blocklist, false));
+        let preset = Arc::new(PlexEpisodePrediction::new(lookahead, vec![], blocklist, false));
         Self::new_full_pipeline_with_preset(preset)
     }
 
@@ -289,7 +289,7 @@ impl OvermountHarness {
         let mut fs = FsCache::new(dir.path())?;
         let backing_store = Arc::clone(&fs.backing_store);
 
-        let preset = Arc::new(PlexEpisodePrediction::new(lookahead, vec![], false));
+        let preset = Arc::new(PlexEpisodePrediction::new(lookahead, vec![], vec![], false));
         fs.preset = Some(Arc::clone(&preset) as Arc<dyn CachePreset>);
 
         let db = Arc::new(CacheDb::open(&cache_dir.path().join("test.db"))?);
@@ -416,7 +416,7 @@ impl MultiFuseHarness {
             let mut fs = FsCache::new(backing.path())?;
             let backing_store = Arc::clone(&fs.backing_store);
 
-            let preset = Arc::new(PlexEpisodePrediction::new(lookahead, vec![], false));
+            let preset = Arc::new(PlexEpisodePrediction::new(lookahead, vec![], vec![], false));
             fs.preset = Some(Arc::clone(&preset) as Arc<dyn CachePreset>);
 
             let cache_mgr = Arc::new(CacheManager::new(

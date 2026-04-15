@@ -248,13 +248,14 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             config.logging.repeat_log_window_secs,
         );
 
+        let plex_allowlist  = config.plex.process_allowlist.clone();
         let plex_blocklist  = config.plex.process_blocklist.clone();
         let rolling_buffer  = config.plex.mode == "rolling-buffer";
 
         let preset: Arc<dyn preset::CachePreset> = match config.preset.name.as_str() {
             "plex-episode-prediction" | "episode-prediction" => Arc::new(
                 presets::plex_episode_prediction::PlexEpisodePrediction::new(
-                    config.plex.lookahead, plex_blocklist, rolling_buffer,
+                    config.plex.lookahead, plex_allowlist, plex_blocklist, rolling_buffer,
                 ),
             ),
             "prefetch" => {
@@ -264,6 +265,7 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                     presets::prefetch::Prefetch::new(
                         mode,
                         config.prefetch.max_depth,
+                        config.prefetch.process_allowlist.clone(),
                         config.prefetch.process_blocklist.clone(),
                         &config.prefetch.file_whitelist,
                         &config.prefetch.file_blacklist,
@@ -278,7 +280,7 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                 );
                 Arc::new(
                     presets::plex_episode_prediction::PlexEpisodePrediction::new(
-                        config.plex.lookahead, plex_blocklist, rolling_buffer,
+                        config.plex.lookahead, plex_allowlist, plex_blocklist, rolling_buffer,
                     ),
                 )
             }

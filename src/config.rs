@@ -181,6 +181,12 @@ pub struct PrefetchConfig {
     /// Max directory depth for cache-parent-recursively mode.
     #[serde(default = "default_max_depth")]
     pub max_depth: usize,
+    /// Process binary names (and their children) that are allowed to trigger caching.
+    /// If non-empty, only these processes (and their children) can trigger caching;
+    /// all others are silently ignored. Empty list (default) disables the allowlist
+    /// and falls through to process_blocklist logic.
+    #[serde(default)]
+    pub process_allowlist: Vec<String>,
     /// Process binary names (and their children) that must never trigger caching.
     #[serde(default)]
     pub process_blocklist: Vec<String>,
@@ -199,6 +205,7 @@ impl Default for PrefetchConfig {
         Self {
             mode: default_prefetch_mode(),
             max_depth: default_max_depth(),
+            process_allowlist: Vec::new(),
             process_blocklist: Vec::new(),
             file_whitelist: Vec::new(),
             file_blacklist: Vec::new(),
@@ -228,6 +235,12 @@ pub struct PlexConfig {
     /// "rolling-buffer" — also predict on hits, keeping the next N episodes always loaded.
     #[serde(default = "default_plex_mode")]
     pub mode: String,
+    /// Process binary names (and their children) that are allowed to trigger prediction.
+    /// If non-empty, only these processes (and their children) can trigger prediction;
+    /// all others are silently ignored. Empty list (default) disables the allowlist
+    /// and falls through to process_blocklist logic.
+    #[serde(default)]
+    pub process_allowlist: Vec<String>,
     /// Process binary names (and their children) that must never trigger prediction.
     #[serde(default)]
     pub process_blocklist: Vec<String>,
@@ -238,6 +251,7 @@ impl Default for PlexConfig {
         Self {
             lookahead: default_lookahead(),
             mode: default_plex_mode(),
+            process_allowlist: Vec::new(),
             process_blocklist: Vec::new(),
         }
     }

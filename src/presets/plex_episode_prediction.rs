@@ -21,14 +21,15 @@ use crate::prediction_utils;
 /// the presence of any streaming format takes precedence and keeps the open un-filtered.
 pub struct PlexEpisodePrediction {
     pub lookahead: usize,
+    pub allowlist: Vec<String>,
     pub blocklist: Vec<String>,
     /// If true, on_hit() also triggers lookahead — keeps the next N episodes always loaded.
     pub rolling_buffer: bool,
 }
 
 impl PlexEpisodePrediction {
-    pub fn new(lookahead: usize, blocklist: Vec<String>, rolling_buffer: bool) -> Self {
-        Self { lookahead, blocklist, rolling_buffer }
+    pub fn new(lookahead: usize, allowlist: Vec<String>, blocklist: Vec<String>, rolling_buffer: bool) -> Self {
+        Self { lookahead, allowlist, blocklist, rolling_buffer }
     }
 }
 
@@ -67,6 +68,10 @@ impl CachePreset for PlexEpisodePrediction {
     }
 
     fn should_filter(&self, process: &ProcessInfo) -> bool {
+        // Allowlist: if non-empty, only allowed processes (and their children) may trigger.
+        if !self.allowlist.is_empty() && !process.is_allowed_by(&self.allowlist) {
+            return true;
+        }
         // Check the explicit blocklist (Scanner, EAE Service, Fingerprinter, etc.).
         if !self.blocklist.is_empty() && process.is_blocked_by(&self.blocklist) {
             return true;

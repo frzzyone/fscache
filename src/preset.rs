@@ -32,6 +32,16 @@ impl ProcessInfo {
         }
         self.ancestors.iter().any(|a| blocklist.iter().any(|b| a == b))
     }
+
+    /// Returns true if this process or any ancestor is in `allowlist`.
+    pub fn is_allowed_by(&self, allowlist: &[String]) -> bool {
+        if let Some(ref name) = self.name {
+            if allowlist.iter().any(|w| name == w) {
+                return true;
+            }
+        }
+        self.ancestors.iter().any(|a| allowlist.iter().any(|w| a == w))
+    }
 }
 
 fn proc_name(pid: u32) -> Option<String> {

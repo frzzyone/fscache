@@ -37,6 +37,7 @@ fn make_prefetch(
         mode,
         max_depth,
         vec![],
+        vec![],
         &whitelist.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         &blacklist.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
     )
@@ -81,6 +82,7 @@ fn test_invalid_whitelist_regex_fails_construction() {
         PrefetchMode::CacheHitOnly,
         3,
         vec![],
+        vec![],
         &["[unclosed bracket".to_string()],
         &[],
     );
@@ -95,6 +97,7 @@ fn test_invalid_blacklist_regex_fails_construction() {
         PrefetchMode::CacheHitOnly,
         3,
         vec![],
+        vec![],
         &[],
         &["(?invalid".to_string()],
     );
@@ -106,6 +109,7 @@ fn test_valid_patterns_compile() {
     let result = Prefetch::new(
         PrefetchMode::CacheNeighbors,
         3,
+        vec![],
         vec![],
         &[r"\.mkv$".to_string(), r"\.mp4$".to_string()],
         &[r"\.nfo$".to_string(), r"\.jpg$".to_string()],
@@ -411,6 +415,7 @@ fn test_blocklist_filters_process() {
     let preset = Prefetch::new(
         PrefetchMode::CacheHitOnly,
         3,
+        vec![],
         vec!["Plex Media Scanner".to_string()],
         &[],
         &[],

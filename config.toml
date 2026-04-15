@@ -14,6 +14,9 @@ mode = "cache-hit-only"                  # "cache-hit-only" — cache only the a
                                          # "cache-neighbors" — cache all sibling files in the same directory
                                          # "cache-parent-recursively" — recursively cache parent directory up to max_depth levels
 max_depth = 3                            # Max recursion depth for cache-parent-recursively (default 3)
+process_allowlist = []                   # Process binary names (and their children) allowed to trigger caching
+                                         # If non-empty, ONLY these processes can trigger caching; all others are silently ignored
+                                         # Empty list (default) disables the allowlist — falls through to process_blocklist
 process_blocklist = []                   # Process binary names (and their children) that must never trigger caching
 file_whitelist = []                      # Regex patterns matched against filename — only matching files are cached
                                          # Empty list = allow all files (when blacklist is also empty)
@@ -24,6 +27,9 @@ file_blacklist = []                      # Regex patterns matched against filena
 [plex]
 lookahead = 4                            # Episodes to cache ahead of the current one
 mode = "miss-only"                       # "miss-only" | "rolling-buffer" (keep next N always loaded)
+process_allowlist = []                   # Process binary names (and their children) allowed to trigger prediction
+                                         # If non-empty, ONLY these processes can trigger prediction; all others are silently ignored
+                                         # Empty list (default) disables the allowlist — falls through to process_blocklist
 process_blocklist = ["Plex Media Scanner", "Plex EAE Service", "Plex Media Fingerprinter"]
                                          # Process binary names (and their children) never allowed to trigger prediction:
                                          # "Plex Media Scanner" — visual analysis / thumbnail generation, never streams to users

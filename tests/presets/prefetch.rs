@@ -26,6 +26,7 @@ fn make_preset(
             mode,
             max_depth,
             vec![],
+            vec![],
             &whitelist.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             &blacklist.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         )
@@ -89,6 +90,7 @@ async fn cache_hit_only_respects_blocklist() {
         Prefetch::new(
             PrefetchMode::CacheHitOnly,
             3,
+            vec![],
             vec!["cat".to_string()],
             &[],
             &[],

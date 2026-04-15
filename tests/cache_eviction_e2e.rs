@@ -38,7 +38,7 @@ const BUDGET_GB: f64 = (FILE_BYTES * BUDGET_FILES) as f64 / 1_073_741_824.0;
 
 fn cache_hit_only_preset() -> Arc<Prefetch> {
     Arc::new(
-        Prefetch::new(PrefetchMode::CacheHitOnly, 1, vec![], &[], &[])
+        Prefetch::new(PrefetchMode::CacheHitOnly, 1, vec![], vec![], &[], &[])
             .expect("preset should compile"),
     )
 }

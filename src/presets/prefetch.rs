@@ -28,6 +28,7 @@ pub enum PrefetchMode {
 pub struct Prefetch {
     mode: PrefetchMode,
     max_depth: usize,
+    process_allowlist: Vec<String>,
     blocklist: Vec<String>,
     whitelist: Vec<Regex>,
     blacklist: Vec<Regex>,
@@ -39,6 +40,7 @@ impl Prefetch {
     pub fn new(
         mode: PrefetchMode,
         max_depth: usize,
+        process_allowlist: Vec<String>,
         blocklist: Vec<String>,
         whitelist_patterns: &[String],
         blacklist_patterns: &[String],
@@ -57,6 +59,7 @@ impl Prefetch {
         Ok(Self {
             mode,
             max_depth,
+            process_allowlist,
             blocklist,
             whitelist: compile(whitelist_patterns)?,
             blacklist: compile(blacklist_patterns)?,
@@ -136,6 +139,10 @@ impl CachePreset for Prefetch {
     }
 
     fn should_filter(&self, process: &ProcessInfo) -> bool {
+        // Allowlist: if non-empty, only allowed processes (and their children) may trigger.
+        if !self.process_allowlist.is_empty() && !process.is_allowed_by(&self.process_allowlist) {
+            return true;
+        }
         if self.blocklist.is_empty() {
             return false;
         }
