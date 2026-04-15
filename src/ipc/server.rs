@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tokio::net::UnixListener;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::broadcast;
 use tokio::time::{timeout, Duration};
+use tokio_util::sync::CancellationToken;
 
 use crate::cache::db::CacheDb;
 use super::protocol::{ClientMessage, DaemonMessage, LogLine};
@@ -14,14 +15,13 @@ use super::{framed_split, recv_msg, send_msg};
 ///
 /// Each client receives a copy of `hello` on connection, then a stream of
 /// broadcast events. Clients can send `ClientMessage::Shutdown` to trigger
-/// daemon shutdown. Runs until `shutdown_rx` fires, then broadcasts `Goodbye`
-/// and removes the socket file.
+/// daemon shutdown. Runs until `shutdown` is cancelled, then broadcasts
+/// `Goodbye` and removes the socket file.
 pub async fn run_ipc_server(
     socket_path: PathBuf,
     hello: DaemonMessage,
     events: broadcast::Sender<DaemonMessage>,
-    shutdown_tx: watch::Sender<bool>,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown: CancellationToken,
     recent: Arc<Mutex<VecDeque<LogLine>>>,
     db: Arc<CacheDb>,
 ) -> anyhow::Result<()> {
@@ -58,13 +58,13 @@ pub async fn run_ipc_server(
                     Ok((stream, _)) => {
                         let hello_clone  = hello.clone();
                         let mut rx       = events.subscribe();
-                        let sd_tx        = shutdown_tx.clone();
+                        let sd          = shutdown.clone();
                         let peer_path    = socket_path.clone();
                         let recent_clone = Arc::clone(&recent);
                         let db_clone     = Arc::clone(&db);
                         tokio::spawn(async move {
                             let peer = format!("client@{}", peer_path.display());
-                            if let Err(e) = handle_client(stream, hello_clone, &mut rx, sd_tx, recent_clone, db_clone).await {
+                            if let Err(e) = handle_client(stream, hello_clone, &mut rx, sd, recent_clone, db_clone).await {
                                 tracing::debug!("{peer} disconnected: {e}");
                             } else {
                                 tracing::debug!("{peer} disconnected cleanly");
@@ -77,11 +77,7 @@ pub async fn run_ipc_server(
                 }
             }
 
-            Ok(_) = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    break;
-                }
-            }
+            _ = shutdown.cancelled() => break,
         }
     }
 
@@ -100,7 +96,7 @@ async fn handle_client(
     stream: tokio::net::UnixStream,
     hello: DaemonMessage,
     rx: &mut broadcast::Receiver<DaemonMessage>,
-    shutdown_tx: watch::Sender<bool>,
+    shutdown: CancellationToken,
     recent: Arc<Mutex<VecDeque<LogLine>>>,
     db: Arc<CacheDb>,
 ) -> anyhow::Result<()> {
@@ -143,7 +139,7 @@ async fn handle_client(
                 match frame? {
                     Some(ClientMessage::Shutdown) => {
                         tracing::info!("IPC: received Shutdown command from TUI client");
-                        let _ = shutdown_tx.send(true);
+                        shutdown.cancel();
                         return Ok(());
                     }
                     Some(ClientMessage::EvictFiles { files }) => {

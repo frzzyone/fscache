@@ -162,8 +162,10 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     let max_cache_pull_bytes =
         (config.cache.max_cache_pull_per_mount_gb * 1_073_741_824.0) as u64;
 
-    // Shared with IPC server so TUI clients can request daemon shutdown.
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    // Shared with all background tasks so any of them (or a signal) can
+    // trigger a clean shutdown. A JoinSet tracks their handles for draining.
+    let shutdown_token = tokio_util::sync::CancellationToken::new();
+    let mut background: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     let socket_path = ipc::server::socket_path(instance_name);
 
@@ -187,15 +189,18 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     });
 
     // Bind early (before FUSE mounts) to minimise discovery gap for `fscache watch`.
-    tokio::spawn(ipc::server::run_ipc_server(
-        socket_path,
-        hello,
-        ipc_tx,
-        shutdown_tx.clone(),
-        shutdown_rx.clone(),
-        recent_logs,
-        Arc::clone(&db),
-    ));
+    let ipc_token = shutdown_token.clone();
+    let ipc_db    = Arc::clone(&db);
+    background.spawn(async move {
+        let _ = ipc::server::run_ipc_server(
+            socket_path,
+            hello,
+            ipc_tx,
+            ipc_token,
+            recent_logs,
+            ipc_db,
+        ).await;
+    });
 
     tracing::info!(
         "Schedule: caching allowed {} to {}",
@@ -311,7 +316,7 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             &config.schedule.cache_window_end,
         )?;
 
-        let cache_io = cache::io::CacheIO::spawn(
+        let (cache_io, io_handles) = cache::io::CacheIO::spawn(
             cache::io::CacheIoConfig {
                 max_concurrent_copies: config.cache.max_concurrent_copies,
                 eviction_interval_secs: config.eviction.poll_interval_secs,
@@ -320,7 +325,11 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             Arc::clone(&cache_manager),
             Arc::clone(&backing_store),
             scheduler,
+            shutdown_token.clone(),
         );
+        for h in io_handles {
+            background.spawn(async move { let _ = h.await; });
+        }
 
         let engine = engine::action::ActionEngine::new(
             access_rx,
@@ -332,11 +341,12 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             config.cache.min_access_secs,
             config.cache.min_file_size_mb,
         );
-        tokio::spawn(engine.run());
+        background.spawn(engine.run(shutdown_token.clone()));
         if config.eviction.poll_interval_secs > 0 && config.invalidation.check_on_maintenance {
-            tokio::spawn(engine::action::run_maintenance_task(
+            background.spawn(engine::action::run_maintenance_task(
                 Arc::clone(&cache_manager),
                 config.eviction.poll_interval_secs,
+                shutdown_token.clone(),
             ));
         }
 
@@ -359,16 +369,12 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     )?;
 
     tokio::select! {
-        _ = tokio::signal::ctrl_c()  => tracing::info!("Received SIGINT"),
-        _ = sigterm.recv()           => tracing::info!("Received SIGTERM"),
-        Ok(_) = shutdown_rx.changed() => {
-            if *shutdown_rx.borrow() {
-                tracing::info!("Shutdown requested via IPC");
-            }
-        }
+        _ = tokio::signal::ctrl_c() => tracing::info!("Received SIGINT"),
+        _ = sigterm.recv()          => tracing::info!("Received SIGTERM"),
+        _ = shutdown_token.cancelled() => tracing::info!("Shutdown requested via IPC"),
     }
 
-    let _ = shutdown_tx.send(true);
+    shutdown_token.cancel();
 
     for mount in &mounts {
         let mount_name = mount.target.file_name()
@@ -399,7 +405,26 @@ async fn run_daemon(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         }
     }
 
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    // Drain background tasks. Each task observes the token and breaks its loop;
+    // any in-flight spawn_blocking work (one sweep / one eviction pass) is allowed
+    // to finish. The 15s timeout backstops a sweep stuck on slow stat() calls.
+    let drain = async {
+        while let Some(res) = background.join_next().await {
+            if let Err(e) = res {
+                tracing::warn!("background task join error: {e}");
+            }
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(15), drain).await.is_err() {
+        tracing::warn!(
+            "background tasks did not drain within 15s; {} still pending",
+            background.len()
+        );
+        background.abort_all();
+    }
+
+    // Drop mounts AFTER drain so the FUSE destroy() callback fires before
+    // "Shutdown complete." is logged.
     drop(mounts);
     tracing::info!("Shutdown complete.");
     Ok(())

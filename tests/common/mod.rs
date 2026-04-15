@@ -13,6 +13,7 @@ use fscache::presets::plex_episode_prediction::PlexEpisodePrediction;
 use fscache::engine::scheduler::Scheduler;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 fn test_fuse_config() -> fuser::Config {
     let mut config = fuser::Config::default();
@@ -214,7 +215,8 @@ impl FuseHarness {
         fs.access_tx = Some(access_tx);
 
         let scheduler = Scheduler::new("00:00", "23:59").unwrap();
-        let cache_io = CacheIO::spawn(
+        let shutdown = CancellationToken::new();
+        let (cache_io, _io_handles) = CacheIO::spawn(
             CacheIoConfig {
                 max_concurrent_copies: 1,
                 eviction_interval_secs,
@@ -223,6 +225,7 @@ impl FuseHarness {
             Arc::clone(&cache_mgr),
             Arc::clone(&backing_store),
             scheduler,
+            shutdown.clone(),
         );
         let engine = ActionEngine::new(
             access_rx,
@@ -234,7 +237,7 @@ impl FuseHarness {
             0,
             0,
         );
-        tokio::spawn(engine.run());
+        tokio::spawn(engine.run(shutdown));
 
         let session = fuser::spawn_mount2(fs, mount.path(), &test_fuse_config())?;
 
@@ -310,11 +313,13 @@ impl OvermountHarness {
         fs.access_tx = Some(access_tx);
 
         let scheduler = Scheduler::new("00:00", "23:59").unwrap();
-        let cache_io = CacheIO::spawn(
+        let shutdown = CancellationToken::new();
+        let (cache_io, _io_handles) = CacheIO::spawn(
             CacheIoConfig { max_concurrent_copies: 1, eviction_interval_secs: 0, deferred_ttl_minutes: 0 },
             Arc::clone(&cache_mgr),
             Arc::clone(&backing_store),
             scheduler,
+            shutdown.clone(),
         );
         let engine = ActionEngine::new(
             access_rx,
@@ -326,7 +331,7 @@ impl OvermountHarness {
             0,
             0,
         );
-        tokio::spawn(engine.run());
+        tokio::spawn(engine.run(shutdown));
 
         // AutoUnmount requires SessionACL::All (root) so cannot be used in tests.
         // Clean unmount is guaranteed by drop ordering: _session drops first.
@@ -436,11 +441,13 @@ impl MultiFuseHarness {
             fs.access_tx = Some(access_tx);
 
             let scheduler = Scheduler::new("00:00", "23:59").unwrap();
-            let cache_io = CacheIO::spawn(
+            let shutdown = CancellationToken::new();
+            let (cache_io, _io_handles) = CacheIO::spawn(
                 CacheIoConfig { max_concurrent_copies: 1, eviction_interval_secs: 0, deferred_ttl_minutes: 0 },
                 Arc::clone(&cache_mgr),
                 Arc::clone(&backing_store),
                 scheduler,
+                shutdown.clone(),
             );
             let engine = ActionEngine::new(
                 access_rx,
@@ -452,7 +459,7 @@ impl MultiFuseHarness {
                 0,
                 0,
             );
-            tokio::spawn(engine.run());
+            tokio::spawn(engine.run(shutdown));
 
             let session = fuser::spawn_mount2(fs, mount.path(), &test_fuse_config())?;
             mounts.push(FuseHarness { backing, mount, cache: None, cache_mgr: Some(Arc::clone(&cache_mgr)), _session: session });

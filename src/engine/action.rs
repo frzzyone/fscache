@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 use crate::backing_store::BackingStore;
 use crate::cache::io::CacheIO;
@@ -74,7 +75,7 @@ impl ActionEngine {
         }
     }
 
-    pub async fn run(self) {
+    pub async fn run(self, shutdown: CancellationToken) {
         let ActionEngine {
             mut rx, cache_io, cache, preset,
             backing_store, max_cache_pull_bytes,
@@ -90,6 +91,8 @@ impl ActionEngine {
             let mut to_process: Vec<AccessEvent> = Vec::new();
 
             tokio::select! {
+                _ = shutdown.cancelled() => break,
+
                 result = rx.recv() => {
                     match result {
                         Some(event) => {
@@ -167,6 +170,8 @@ impl ActionEngine {
                                 }
                             }
                         }
+                        // Test-only exit path: production exits via shutdown.cancelled()
+                        // because access_tx is held by the FUSE session until drop(mounts).
                         None => break,
                     }
                 }
@@ -258,22 +263,26 @@ impl ActionEngine {
 pub async fn run_maintenance_task(
     cache: Arc<CacheManager>,
     poll_interval_secs: u64,
+    shutdown: CancellationToken,
 ) {
     if poll_interval_secs == 0 {
         return;
     }
     let interval = Duration::from_secs(poll_interval_secs);
     loop {
-        tokio::time::sleep(interval).await;
-
-        let cache_clone = Arc::clone(&cache);
-        tokio::task::spawn_blocking(move || {
-            let (checked, dropped) = cache_clone.sweep_stale();
-            tracing::info!(
-                "maintenance stale sweep: checked={checked} dropped={dropped}"
-            );
-        })
-        .await
-        .ok();
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {
+                let cache_clone = Arc::clone(&cache);
+                tokio::task::spawn_blocking(move || {
+                    let (checked, dropped) = cache_clone.sweep_stale();
+                    tracing::info!(
+                        "maintenance stale sweep: checked={checked} dropped={dropped}"
+                    );
+                })
+                .await
+                .ok();
+            }
+            _ = shutdown.cancelled() => break,
+        }
     }
 }

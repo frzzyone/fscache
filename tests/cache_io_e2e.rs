@@ -44,6 +44,7 @@ use fscache::cache::io::{CacheIO, CacheIoConfig};
 use fscache::cache::manager::CacheManager;
 use fscache::config::InvalidationConfig;
 use fscache::engine::scheduler::Scheduler;
+use tokio_util::sync::CancellationToken;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use filetime;
@@ -64,7 +65,7 @@ fn spawn_cache_io(
     deferred_ttl_minutes: u64,
 ) -> CacheIO {
     let scheduler = Scheduler::new("00:00", "23:59").unwrap();
-    CacheIO::spawn(
+    let (cache_io, _io_handles) = CacheIO::spawn(
         CacheIoConfig {
             max_concurrent_copies: 1,
             eviction_interval_secs: 0,
@@ -73,7 +74,9 @@ fn spawn_cache_io(
         cache_mgr,
         backing_store,
         scheduler,
-    )
+        CancellationToken::new(),
+    );
+    cache_io
 }
 
 fn make_db(cache_dir: &std::path::Path) -> Arc<CacheDb> {

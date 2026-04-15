@@ -7,9 +7,11 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use crate::backing_store::BackingStore;
 use crate::cache::manager::CacheManager;
@@ -70,12 +72,17 @@ pub struct CacheIO {
 
 impl CacheIO {
     /// Spawn the dispatcher and eviction worker tasks, then return a shareable handle.
+    ///
+    /// Returns `(handle, task_handles)`. In production, callers should move the task
+    /// handles into a `JoinSet` so they can be drained on shutdown. In tests, dropping
+    /// the handles is fine — the tasks run until the tokio runtime ends.
     pub fn spawn(
         cfg: CacheIoConfig,
         cache: Arc<CacheManager>,
         backing_store: Arc<BackingStore>,
         scheduler: Scheduler,
-    ) -> Self {
+        shutdown: CancellationToken,
+    ) -> (Self, Vec<tokio::task::JoinHandle<()>>) {
         let db = cache.cache_db();
 
         let mut initial = PipelineState::new();
@@ -109,7 +116,8 @@ impl CacheIO {
             deferred_ttl_minutes: cfg.deferred_ttl_minutes,
         };
 
-        tokio::spawn(dispatcher(handle.clone()));
+        let mut task_handles = Vec::new();
+        task_handles.push(tokio::spawn(dispatcher(handle.clone(), shutdown.clone())));
 
         // If we rehydrated entries from the DB, wake the dispatcher immediately
         // rather than waiting for the first submit_cache call or the 10-second tick.
@@ -120,12 +128,13 @@ impl CacheIO {
         if cfg.eviction_interval_secs > 0 {
             let evict_cache = Arc::clone(&cache);
             let interval_secs = cfg.eviction_interval_secs;
-            tokio::spawn(async move {
-                eviction_worker(evict_cache, interval_secs).await;
-            });
+            let evict_shutdown = shutdown.clone();
+            task_handles.push(tokio::spawn(async move {
+                eviction_worker(evict_cache, interval_secs, evict_shutdown).await;
+            }));
         }
 
-        handle
+        (handle, task_handles)
     }
 
     /// Submit a path for caching. This is the single entrypoint for all cache requests.
@@ -219,11 +228,12 @@ impl CacheIO {
 /// The dispatcher is the only place the caching window is consulted.
 /// It wakes on every `submit_cache` call and every 10 s tick (to re-check the
 /// window when no submissions are arriving), draining the queue whenever allowed.
-async fn dispatcher(io: CacheIO) {
+async fn dispatcher(io: CacheIO, shutdown: CancellationToken) {
     loop {
         tokio::select! {
             _ = io.notify.notified() => {}
             _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+            _ = shutdown.cancelled() => break,
         }
 
         let allowed = io.scheduler.is_caching_allowed();
@@ -245,6 +255,7 @@ async fn dispatcher(io: CacheIO) {
         // blocks here (rather than pre-spawning unbounded tasks), so the
         // queue reflects real backlog instead of just "in-flight + queued".
         loop {
+            if shutdown.is_cancelled() { break; }
             let next = { io.state.lock().await.queue.pop_front() };
             let Some((rel_path, _)) = next else { break };
 
@@ -304,13 +315,48 @@ async fn copy_worker(io: CacheIO, rel_path: PathBuf) {
         rel_path.display(),
     );
 
+    let bytes_copied = Arc::new(AtomicU64::new(0));
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Fires zero times for copies that complete in under 500 ms.
+    {
+        let ticker_bytes = Arc::clone(&bytes_copied);
+        let ticker_path  = rel_path.clone();
+        let ticker_size  = size_bytes;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await; // discard immediate first tick
+            let mut done = done_rx;
+            loop {
+                tokio::select! {
+                    _ = &mut done => break,
+                    _ = interval.tick() => {
+                        tracing::debug!(
+                            event = telemetry::EVENT_COPY_PROGRESS,
+                            path = %ticker_path.display(),
+                            bytes_copied = ticker_bytes.load(Ordering::Relaxed),
+                            size_bytes = ticker_size,
+                            "cache_io: progress",
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     let bs = Arc::clone(&io.backing_store);
     let rel = rel_path.clone();
     let dest = cache_dest.clone();
+    let progress = Arc::clone(&bytes_copied);
     let result = tokio::task::spawn_blocking(move || {
-        perform_copy(&bs, &rel, &dest)
+        perform_copy(&bs, &rel, &dest, &progress)
     })
     .await;
+
+    // Stop the ticker before emitting COPY_COMPLETE / COPY_FAILED so no
+    // late progress event races past the completion signal.
+    let _ = done_tx.send(());
 
     match result {
         Ok(Ok(())) => {
@@ -353,15 +399,19 @@ async fn finish_known(io: &CacheIO, rel_path: &Path) {
     io.cache.cache_db().remove_deferred(rel_path);
 }
 
-async fn eviction_worker(cache: Arc<CacheManager>, interval_secs: u64) {
+async fn eviction_worker(cache: Arc<CacheManager>, interval_secs: u64, shutdown: CancellationToken) {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
     ticker.tick().await;
     loop {
-        ticker.tick().await;
-        let cache_clone = Arc::clone(&cache);
-        tokio::task::spawn_blocking(move || cache_clone.evict_if_needed())
-            .await
-            .ok();
+        tokio::select! {
+            _ = ticker.tick() => {
+                let cache_clone = Arc::clone(&cache);
+                tokio::task::spawn_blocking(move || cache_clone.evict_if_needed())
+                    .await
+                    .ok();
+            }
+            _ = shutdown.cancelled() => break,
+        }
     }
 }
 
@@ -379,6 +429,7 @@ fn perform_copy(
     bs: &BackingStore,
     rel_path: &Path,
     cache_dest: &Path,
+    bytes_copied: &AtomicU64,
 ) -> std::io::Result<()> {
     if let Some(parent) = cache_dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -417,6 +468,7 @@ fn perform_copy(
             let n = src.read(&mut buf)?;
             if n == 0 { break; }
             dst.write_all(&buf[..n])?;
+            bytes_copied.fetch_add(n as u64, Ordering::Relaxed);
         }
         Ok(())
     })();
@@ -483,5 +535,6 @@ pub fn copy_for_tests(
     rel_path: &Path,
     cache_dest: &Path,
 ) -> std::io::Result<()> {
-    perform_copy(bs, rel_path, cache_dest)
+    let dummy = AtomicU64::new(0);
+    perform_copy(bs, rel_path, cache_dest, &dummy)
 }
